@@ -73,29 +73,34 @@ class BankAccount(AbstractAccount):
         super().__init__(owner, account_id, status)
         self.currency = currency
 
-    def deposit(self, amount):
+    def _validate_status(self):
         if self.account_status == AccountStatus.FROZEN:
-            raise AccountFrozenError("AccountFrozenError")
-
-        elif self.account_status == AccountStatus.CLOSED:
-            raise AccountClosedError("AccountClosedError")
-
-        if not isinstance(amount, Decimal) or not amount.is_finite() or amount <= 0:
-            raise InvalidOperationError("InvalidOperationError")
-        self._balance += amount
-
-    def withdraw(self, amount):
-        if self.account_status == AccountStatus.FROZEN:
-            raise AccountFrozenError("AccountFrozenError")
+            raise AccountFrozenError("Account is frozen")
 
         if self.account_status == AccountStatus.CLOSED:
-            raise AccountClosedError("AccountClosedError")
+            raise AccountClosedError("Account is closed")
 
-        if not isinstance(amount, Decimal) or not amount.is_finite() or amount <= 0:
-            raise InvalidOperationError("Invalid withdrawal amount")
+    def _validate_amount(self, amount: Decimal):
+        if (
+                not isinstance(amount, Decimal)
+                or not amount.is_finite()
+                or amount <= 0
+        ):
+            raise InvalidOperationError("Invalid transaction amount")
+
+    def deposit(self, amount: Decimal):
+        self._validate_status()
+        self._validate_amount(amount)
+
+        self._balance += amount
+
+    def withdraw(self, amount: Decimal):
+        self._validate_status()
+        self._validate_amount(amount)
 
         if amount > self._balance:
             raise InsufficientFundsError("Insufficient funds")
+
         self._balance -= amount
 
     def get_account_info(self):
