@@ -88,6 +88,10 @@ class BankAccount(AbstractAccount):
         ):
             raise InvalidOperationError("Invalid transaction amount")
 
+    def _validate_funds(self, amount: Decimal):
+        if amount > self._balance:
+            raise InsufficientFundsError("Insufficient funds")
+
     def deposit(self, amount: Decimal):
         self._validate_status()
         self._validate_amount(amount)
@@ -97,9 +101,7 @@ class BankAccount(AbstractAccount):
     def withdraw(self, amount: Decimal):
         self._validate_status()
         self._validate_amount(amount)
-
-        if amount > self._balance:
-            raise InsufficientFundsError("Insufficient funds")
+        self._validate_funds(amount)
 
         self._balance -= amount
 
