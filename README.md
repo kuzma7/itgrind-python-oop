@@ -1,50 +1,84 @@
-# Bank Account Management — Python OOP
+# Bank Management System — Python OOP
 
-A bank account management system developed as part of the **ItGrind ML/NLP course**.
+A banking management system developed as part of the **ItGrind ML/NLP course**, Python Object-Oriented Programming module.
 
-The project demonstrates core Object-Oriented Programming (OOP) concepts in Python, including **abstraction, inheritance, encapsulation, polymorphism, method overriding, and custom exception handling**.
+The project demonstrates abstraction, inheritance, encapsulation, polymorphism, composition, and custom exception handling.
 
-The system supports multiple account types with different business rules, monetary operations, and automated tests.
+Built incrementally across three assignments, the system supports multiple bank account types, client management, authentication, account security, and financial analytics.
 
 ## Features
 
-### Core Functionality
-- Abstract `AbstractAccount` class defining a common interface.
-- Concrete `BankAccount` implementation.
+### Bank Accounts
+
+The system supports four account types:
+
+| Account | Functionality |
+|---|---|
+| `BankAccount` | Standard deposits and withdrawals |
+| `SavingsAccount` | Minimum balance and monthly interest |
+| `PremiumAccount` | Withdrawal limits, overdraft, and fixed transaction fees |
+| `InvestmentAccount` | Investment portfolio and projected yearly growth |
+
+Common features include:
+
 - Unique account identifiers generated using UUID.
-- Support for five currencies: RUB, USD, EUR, KZT, CNY.
+- Five supported currencies: RUB, USD, EUR, KZT, CNY.
 - Account statuses: `ACTIVE`, `FROZEN`, `CLOSED`.
-- Deposits and withdrawals using `Decimal` for monetary calculations.
-- Input validation and transaction restrictions.
-- Custom exceptions for invalid operations.
-- Human-readable account information.
+- Monetary calculations using `Decimal`.
+- Transaction validation and custom exceptions.
 
-### Account Types
+### Client Management
 
-**BankAccount — Standard Account**
-- Supports deposits and withdrawals.
-- Prevents withdrawals exceeding the available balance.
-- Restricts transactions on frozen and closed accounts.
+The `Client` class provides:
 
-**SavingsAccount — Savings Account**
-- Minimum balance restriction.
-- Configurable monthly interest rate.
-- Monthly interest calculation and capitalization.
-- Prevents withdrawals that violate the minimum balance.
+- Unique client ID.
+- Full name and contact information.
+- Date of birth and minimum age validation (18+).
+- Client statuses: `ACTIVE`, `BLOCKED`.
+- List of associated bank account IDs.
+- Password verification.
 
-**PremiumAccount — Premium Account**
-- Configurable per-transaction withdrawal limit.
-- Overdraft support allowing a negative balance.
-- Fixed fee charged for each withdrawal.
-- Validation of overdraft and withdrawal limits.
+### Bank Management
 
-**InvestmentAccount — Investment Account**
-- Investment portfolio containing three asset types: `stocks`, `bonds`, and `etf`.
-- Allocation of available funds to investment assets.
-- Portfolio value calculation.
-- Projected yearly growth based on configurable asset growth rates.
-- Withdrawal restrictions for invested funds.
-- Monetary rounding using `ROUND_HALF_UP`.
+The `Bank` class manages clients and their accounts.
+
+Supported operations:
+
+| Method | Description |
+|---|---|
+| `add_client()` | Register a new client |
+| `open_account()` | Open an account for an existing client |
+| `close_account()` | Close an eligible account |
+| `freeze_account()` | Freeze an active account |
+| `unfreeze_account()` | Restore a frozen account |
+| `authenticate_client()` | Authenticate a client using a password |
+| `search_accounts()` | Search accounts by client ID and status |
+| `get_total_balance()` | Calculate total account funds grouped by currency |
+| `get_clients_ranking()` | Rank clients by their funds in a selected currency |
+
+### Security
+
+- Password hashing using PBKDF2-HMAC-SHA256 with a random salt.
+- Automatic client blocking after three consecutive failed login attempts.
+- Reset of the failed-login counter after successful authentication.
+- Logging of suspicious activities.
+- Restrictions on account-management operations from **00:00 to 05:00**.
+- Prevention of invalid account status transitions.
+
+The nighttime restriction applies to account-management methods of `Bank`. Direct account transactions are not subject to this check in the current implementation.
+
+**Note:** This is an educational in-memory application, not a production banking or authentication system.
+
+### Financial Analytics
+
+The system supports:
+
+- Aggregating bank balances by currency.
+- Including investment portfolios in total asset calculations.
+- Accounting for negative Premium account balances.
+- Ranking clients by total funds in a selected currency.
+
+Different currencies are calculated separately without automatic conversion.
 
 ## Project Structure
 
@@ -55,6 +89,8 @@ homework_1/
 │   ├── main.py
 │   ├── models.py
 │   ├── exceptions.py
+│   ├── client.py
+│   ├── bank.py
 │   ├── savings_account.py
 │   ├── premium_account.py
 │   └── investment_account.py
@@ -62,9 +98,10 @@ homework_1/
 │   ├── test_account.py
 │   ├── test_savings_account.py
 │   ├── test_premium_account.py
-│   └── test_investment_account.py
-├── .gitignore
+│   ├── test_investment_account.py
+│   └── test_bank.py
 ├── requirements.txt
+├── .gitignore
 └── README.md
 ```
 
@@ -72,11 +109,8 @@ homework_1/
 
 - Python 3.10+
 - pytest
-- Python Standard Library:
-  - `abc` — Abstract Base Classes
-  - `enum` — Enumerations
-  - `uuid` — Unique account identifiers
-  - `decimal` — Precise decimal arithmetic
+- Python Standard Library: `abc`, `enum`, `uuid`, `decimal`, `datetime`, `hashlib`, `hmac`, `secrets`
+- Git and GitHub
 
 ## Installation
 
@@ -104,135 +138,75 @@ python -m pip install -r requirements.txt
 
 ## Usage
 
-Run the application demonstration from the project root:
+Run the demonstration:
 
 ```bash
 python -m src.main
 ```
 
 The demonstration includes:
-- Standard account deposits and withdrawals.
-- Savings account interest calculation.
-- Premium account overdraft and withdrawal fees.
-- Investment portfolio allocation and projected yearly growth.
-- Handling operations on frozen accounts.
-- Polymorphism using different account types through a common interface.
 
-### Investment Account Example
-
-```python
-from decimal import Decimal
-from src.investment_account import InvestmentAccount
-
-account = InvestmentAccount(owner="Nikita")
-
-account.deposit(Decimal("100000.00"))
-
-account.invest("stocks", Decimal("50000.00"))
-account.invest("bonds", Decimal("30000.00"))
-account.invest("etf", Decimal("20000.00"))
-
-growth_rates = {
-    "stocks": Decimal("0.10"),
-    "bonds": Decimal("0.04"),
-    "etf": Decimal("0.07"),
-}
-
-projected_growth = account.project_yearly_growth(growth_rates)
-
-print(f"Available balance: {account._balance}")
-print(f"Projected yearly growth: {projected_growth}")
-```
-
-Expected output:
-
-```text
-Available balance: 0.00
-Projected yearly growth: 7600.00
-```
-
-The projection does not modify the account balance or portfolio.
+- Registering multiple clients.
+- Opening different account types.
+- Deposits, withdrawals, and investments.
+- Calculating savings interest and investment growth.
+- Freezing and closing accounts.
+- Client authentication and account blocking.
+- Nighttime operation restrictions.
+- Searching accounts and calculating financial statistics.
 
 ## Testing
 
-Automated tests are implemented using **pytest**.
+The project uses **pytest** for automated functional testing.
 
 Run the complete test suite:
 
 ```bash
-python -m pytest -v
+python -m pytest -q
 ```
 
-Run tests for a specific account type:
+Run Bank functionality tests:
 
 ```bash
-python -m pytest tests/test_investment_account.py -v
+python -m pytest tests/test_bank.py -v
 ```
 
-The test suite covers:
+Tests cover the core banking scenarios, including account operations, client registration, authentication, security restrictions, account management, investment calculations, and financial analytics.
 
-- Account creation and validation.
-- Deposits and withdrawals.
-- Minimum balance restrictions.
-- Monthly interest calculation.
-- Premium account fees and overdraft.
-- Investment portfolio allocation.
-- Yearly growth projection and rounding.
-- Invalid asset types and transaction amounts.
-- Account status restrictions.
-- Boundary values and error handling.
-- Preservation of account state after failed operations.
-- Polymorphism and method overriding.
-
-## Custom Exceptions
-
-| Exception | Description |
-|---|---|
-| `AccountFrozenError` | Operation attempted on a frozen account |
-| `AccountClosedError` | Operation attempted on a closed account |
-| `InvalidOperationError` | Invalid input, configuration, or transaction |
-| `InsufficientFundsError` | Insufficient available funds or exceeded financial limits |
+The test suite includes both positive and negative scenarios, with an emphasis on functional behavior rather than excessive isolated checks.
 
 ## OOP Concepts
 
-**Abstraction**
+**Abstraction:** `AbstractAccount` defines the common interface for account implementations.
 
-The `AbstractAccount` class defines the common contract for bank accounts.
+**Inheritance:** Specialized account types extend `BankAccount` and reuse common functionality.
 
-**Inheritance**
+**Encapsulation:** Internal state is stored in attributes such as `_balance` and `_portfolio`, with operations controlled through class methods.
 
-`SavingsAccount`, `PremiumAccount`, and `InvestmentAccount` extend `BankAccount` and reuse its common functionality.
+**Polymorphism:** Different account types provide their own implementations of shared methods.
 
-**Encapsulation**
+**Composition:** `Bank` manages collections of `Client` and `BankAccount` objects.
 
-Account balances and investment portfolios are stored using protected attributes (`_balance`, `_portfolio`). Validation and business rules are implemented through class methods.
+**Method overriding:** Specialized accounts customize business rules while reusing parent methods through `super()`.
 
-**Polymorphism**
-
-Different account types implement their own versions of `withdraw()`, `get_account_info()`, and `__str__()`, allowing them to be used through a common interface.
-
-**Method Overriding**
-
-Child classes customize account behavior while reusing parent functionality with `super()`.
-
-## Learning Objectives
-
-- Practice abstract classes and inheritance.
-- Understand encapsulation and polymorphism.
-- Implement method overriding and `super()`.
-- Work with dictionaries, enums, and `Decimal`.
-- Implement financial business rules.
-- Create and handle custom exceptions.
-- Write parameterized automated tests using pytest.
-- Follow Python coding conventions (PEP 8).
-- Practice Git branching and Pull Request workflows.
-
-## Course
+## Course Progress
 
 **ItGrind — ML/NLP**
 
 Module: Python / Object-Oriented Programming
 
-Assignments:
-- **Day 1:** Bank Account Model
-- **Day 2:** Advanced Bank Accounts — Savings, Premium, and Investment Accounts
+| Assignment | Topic | Status |
+|---|---|---|
+| Day 1 | Abstract Account and BankAccount | Completed |
+| Day 2 | Savings, Premium, and Investment Accounts | Completed |
+| Day 3 | Bank Management, Clients, and Security | Implemented |
+
+## Learning Objectives
+
+- Apply object-oriented programming principles in Python.
+- Design class hierarchies and relationships between objects.
+- Implement financial business rules and validation.
+- Manage application state using dictionaries and lists.
+- Implement basic authentication and access restrictions.
+- Write automated functional tests with pytest.
+- Practice Git branching, commits, and Pull Requests.
