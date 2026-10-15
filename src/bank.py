@@ -1,13 +1,18 @@
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timezone, tzinfo
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable
 
+from src.audit_log import AuditLog
 from src.client import Client, ClientStatus
-from src.exceptions import BankOperationRestrictedError, InvalidOperationError
+from src.exceptions import BankOperationRestrictedError, InvalidOperationError, RiskBlockedError
 from src.investment_account import InvestmentAccount
-from src.models import BankAccount, AccountStatus, Currency, _bank_operation_token, validate_money_precision
+from src.models import (
+    BankAccount, AccountStatus, Currency, DEFAULT_BANK_TIMEZONE,
+    EXCHANGE_RATES_IN_RUB, _bank_operation_token, validate_money_precision,
+)
 from src.premium_account import PremiumAccount
+from src.risk_analyzer import RiskAnalyzer
 from src.transaction import Transaction, TransactionStatus, TransactionType
 
 
@@ -16,16 +21,23 @@ class Bank:
             self,
             name: str,
             clock: Callable[[], datetime] | None = None,
-            bank_timezone: tzinfo = timezone(timedelta(hours=3), "UTC+03:00"),
+            bank_timezone: tzinfo = DEFAULT_BANK_TIMEZONE,
+            audit_log: AuditLog | None = None,
+            risk_analyzer: RiskAnalyzer | None = None,
     ):
         self.name = name
         self.clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
         self.bank_timezone = bank_timezone
+        self.audit_log = audit_log
+        self.risk_analyzer = risk_analyzer
+        if self.risk_analyzer is not None:
+            self.risk_analyzer.bank_timezone = bank_timezone
         self._clients: dict[str, Client] = {}
         self._accounts: dict[str, BankAccount] = {}
         self.suspicious_activities: list[str] = []
         self._operation_token = object()
         self._transaction_results: dict[str, dict] = {}
+        self.transaction_errors: list[dict] = []
 
     def add_client(self, client: Client) -> None:
         if not isinstance(client, Client):
@@ -60,8 +72,10 @@ class Bank:
 
     def _validate_account_access(
             self, client_id: str, account_id: str, operation: str, now: datetime | None = None,
+            *, check_time: bool = True,
     ) -> BankAccount:
-        self._validate_operation_time(operation, now)
+        if check_time:
+            self._validate_operation_time(operation, now)
         if client_id not in self._clients:
             raise InvalidOperationError("Client not found")
         client = self._clients[client_id]
@@ -80,14 +94,40 @@ class Bank:
             _bank_operation_token.reset(token)
 
     def deposit(self, client_id: str, account_id: str, amount: Decimal) -> None:
-        account = self._validate_account_access(client_id, account_id, "deposit")
-        with self._authorize_account_operation():
-            account.deposit(amount)
+        self._execute_immediate_transaction(TransactionType.DEPOSIT, client_id, account_id, amount)
 
     def withdraw(self, client_id: str, account_id: str, amount: Decimal) -> None:
-        account = self._validate_account_access(client_id, account_id, "withdraw")
-        with self._authorize_account_operation():
-            account.withdraw(amount)
+        self._execute_immediate_transaction(TransactionType.WITHDRAWAL, client_id, account_id, amount)
+
+    def _execute_immediate_transaction(
+        self, operation: TransactionType, client_id: str, account_id: str, amount: Decimal,
+    ) -> None:
+        now = self._get_current_time()
+        transaction = Transaction(
+            operation, client_id, amount, self.get_account_currency(account_id),
+            sender_id=account_id if operation is TransactionType.WITHDRAWAL else None,
+            recipient_id=account_id if operation is TransactionType.DEPOSIT else None,
+        )
+        transaction.created_at = transaction.started_at = transaction.last_attempt_at = now
+        transaction.status = TransactionStatus.PROCESSING
+        transaction.attempts = 1
+        try:
+            result = self.execute_transaction(transaction, now=now)
+        except Exception as error:
+            if isinstance(error, BankOperationRestrictedError):
+                transaction.attempts = 0
+            self.record_transaction_error(transaction, error, now)
+            result = self.get_transaction_result(transaction.id)
+            if result is None:
+                transaction.status = TransactionStatus.FAILED
+                transaction.completed_at = now
+                raise
+            # A reporting error after commit must not invite a second debit.
+        for field, value in result.items():
+            setattr(transaction, field, value)
+        transaction.status = TransactionStatus.COMPLETED
+        transaction.failure_reason = None
+        transaction.completed_at = now
 
     def get_account_currency(self, account_id: str) -> Currency:
         if account_id not in self._accounts:
@@ -97,6 +137,63 @@ class Bank:
     def get_transaction_result(self, transaction_id: str) -> dict | None:
         result = self._transaction_results.get(transaction_id)
         return result.copy() if result is not None else None
+
+    def _audit_transaction(
+        self, transaction: Transaction, now: datetime, level: str, event: str, message: str, details: dict,
+    ) -> None:
+        if self.audit_log is not None:
+            self.audit_log.record(
+                level, event, message, client_id=transaction.client_id,
+                transaction_id=transaction.id, details=details, timestamp=now,
+            )
+
+    def record_transaction_error(self, transaction: Transaction, error: Exception, now: datetime) -> list[dict]:
+        entry = {
+            "transaction_id": transaction.id, "attempt": transaction.attempts, "timestamp": now,
+            "error_type": type(error).__name__, "reason": str(error),
+        }
+        transaction.failure_reason = str(error)
+        transaction.errors.append(entry.copy())
+        self.transaction_errors.append(entry.copy())
+        recorded = [entry]
+        if self.audit_log is None or isinstance(error, RiskBlockedError):
+            return recorded
+        deferred = isinstance(error, BankOperationRestrictedError)
+        try:
+            self._audit_transaction(
+                transaction, now, "WARNING" if deferred else "ERROR",
+                "transaction_deferred" if deferred else "transaction_error", str(error),
+                {"error_type": type(error).__name__, "attempt": transaction.attempts,
+                 "amount": transaction.amount, "currency": transaction.currency},
+            )
+        except OSError as audit_error:
+            failure = {**entry, "error_type": type(audit_error).__name__,
+                       "reason": f"Audit write failed: {audit_error}"}
+            transaction.errors.append(failure.copy())
+            self.transaction_errors.append(failure.copy())
+            recorded.append(failure)
+        return recorded
+
+    def _check_transaction_risk(self, transaction: Transaction, now: datetime) -> None:
+        if self.risk_analyzer is None or transaction.transaction_type is TransactionType.DEPOSIT:
+            return
+        amount_in_rub = transaction.amount * EXCHANGE_RATES_IN_RUB[transaction.currency]
+        risk = self.risk_analyzer.analyze(transaction, now, amount_in_rub)
+        details = {
+            "risk_level": risk["level"], "score": risk["score"], "reasons": risk["reasons"],
+            "amount": transaction.amount, "currency": transaction.currency,
+            "amount_in_rub": amount_in_rub,
+        }
+        self._audit_transaction(
+            transaction, now, "INFO" if risk["level"] == "LOW" else "WARNING",
+            "risk_analyzed", "Transaction risk evaluated", details,
+        )
+        if risk["level"] == "HIGH":
+            self._audit_transaction(
+                transaction, now, "WARNING", "transaction_blocked",
+                "Transaction blocked by risk rules", details,
+            )
+            raise RiskBlockedError("Transaction blocked by risk rules: " + ", ".join(risk["reasons"]))
 
     def execute_transaction(
             self,
@@ -113,6 +210,7 @@ class Bank:
             raise InvalidOperationError("Transaction must be processing")
         if transaction.id in self._transaction_results:
             return self._transaction_results[transaction.id].copy()
+        now = now if now is not None else self._get_current_time()
         if not isinstance(external_fee, Decimal) or not external_fee.is_finite() or external_fee < 0:
             raise InvalidOperationError("Invalid external fee")
         validate_money_precision(external_fee)
@@ -130,7 +228,9 @@ class Bank:
             transaction.recipient_id if transaction.transaction_type is TransactionType.DEPOSIT
             else transaction.sender_id
         )
-        account = self._validate_account_access(transaction.client_id, account_id, "transaction", now)
+        account = self._validate_account_access(
+            transaction.client_id, account_id, "transaction", now, check_time=False,
+        )
         if account.currency is not transaction.currency:
             raise InvalidOperationError("Transaction currency must match account currency")
         account._validate_amount(transaction.amount)
@@ -171,6 +271,8 @@ class Bank:
             account._validate_status()
             if recipient is not None:
                 recipient._validate_status()
+            self._check_transaction_risk(transaction, now)
+            self._validate_operation_time("transaction", now)
             try:
                 if transaction.transaction_type is TransactionType.DEPOSIT:
                     account.deposit(transaction.amount)
@@ -195,6 +297,14 @@ class Bank:
                 for changed_account, balance in balances:
                     changed_account._balance = balance
                 raise
+        # The transfer is committed. Reporting failures must not roll it back.
+        if self.risk_analyzer is not None:
+            self.risk_analyzer.remember_success(transaction)
+        self._audit_transaction(
+            transaction, now, "INFO", "transaction_completed", "Transaction completed",
+            {"transaction_type": transaction.transaction_type, "amount": transaction.amount,
+             "currency": transaction.currency, **result},
+        )
         return result.copy()
 
     def invest(self, client_id: str, account_id: str, asset_type: str, amount: Decimal) -> None:

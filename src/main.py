@@ -1,12 +1,14 @@
 ﻿from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
+from src.audit_log import AuditLog
 from src.bank import Bank
 from src.client import Client
 from src.exceptions import InvalidOperationError
 from src.investment_account import InvestmentAccount
 from src.models import AccountStatus, BankAccount, Currency
 from src.premium_account import PremiumAccount
+from src.risk_analyzer import RiskAnalyzer
 from src.savings_account import SavingsAccount
 from src.transaction import ExternalRecipient, Transaction, TransactionType
 from src.transaction_processor import ExternalTransferAdapter, TransactionProcessor
@@ -83,6 +85,89 @@ def demonstrate_transactions() -> None:
         print(f"  {account.owner} / {type(account).__name__}: {account._balance} {account.currency.value}")
 
 
+def demonstrate_audit_and_risk() -> None:
+    print("\nDay 5: audit and risk analysis")
+    now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
+    audit = AuditLog("logs/audit.jsonl", clock=lambda: now)
+    risk = RiskAnalyzer()
+    bank = Bank("Audit Demo Bank", clock=lambda: now, audit_log=audit, risk_analyzer=risk)
+    ivan = Client("Ivan Ivanov", date(1998, 5, 15), {"email": "ivan@example.com"}, "ivan-pass")
+    maria = Client("Maria Petrova", date(1995, 8, 20), {"email": "maria@example.com"}, "maria-pass")
+    bank.add_client(ivan)
+    bank.add_client(maria)
+    sender = BankAccount(ivan.full_name)
+    empty = BankAccount(ivan.full_name)
+    familiar_recipient = BankAccount(maria.full_name)
+    new_recipient = BankAccount(maria.full_name)
+    for client, account in [(ivan, sender), (ivan, empty), (maria, familiar_recipient), (maria, new_recipient)]:
+        bank.open_account(client.client_id, account)
+    queue = TransactionQueue()
+    adapter = ExternalTransferAdapter()
+    processor = TransactionProcessor(bank, queue, adapter)
+    transactions = []
+    external = ExternalRecipient("OTHER-BANK", "EXT-AUDIT-001", Currency.RUB)
+
+    def enqueue(label, amount="10", operation=TransactionType.TRANSFER,
+                recipient_id=None, sender_id=None, external_recipient=None):
+        source = None if operation is TransactionType.DEPOSIT else sender_id or sender.uuid
+        target = recipient_id or familiar_recipient.uuid
+        if operation is TransactionType.DEPOSIT:
+            target = sender.uuid
+        if operation is TransactionType.WITHDRAWAL or external_recipient is not None:
+            target = None
+        transaction = Transaction(
+            operation, ivan.client_id, Decimal(amount), Currency.RUB,
+            sender_id=source, recipient_id=target,
+            is_external=external_recipient is not None, external_recipient=external_recipient,
+        )
+        queue.add(transaction)
+        transactions.append((label, transaction))
+
+    enqueue("Large deposit", "1000000", TransactionType.DEPOSIT)
+    processor.process_all()
+    enqueue("Small transfer to a new recipient")
+    processor.process_all()
+    enqueue("Normal transfer to a familiar recipient", "20")
+    processor.process_all()
+    enqueue("Large transfer to a familiar recipient", "100000")
+    processor.process_all()
+    enqueue("Large transfer to a new external recipient", "100000", external_recipient=external)
+    processor.process_all()
+
+    now += timedelta(minutes=1)
+    for index in range(5):
+        enqueue(f"Frequent withdrawal {index + 1}", "1", TransactionType.WITHDRAWAL)
+    enqueue("Sixth new operation to a new recipient", recipient_id=new_recipient.uuid)
+    processor.process_all()
+
+    now = datetime(2026, 10, 15, 23, tzinfo=timezone.utc)  # 02:00 in bank timezone.
+    enqueue("Night withdrawal deferred until morning", operation=TransactionType.WITHDRAWAL)
+    enqueue("Large night withdrawal blocked by risk", "100000", TransactionType.WITHDRAWAL)
+    processor.process_all()
+    now = datetime(2026, 10, 16, 2, tzinfo=timezone.utc)  # 05:00 in bank timezone.
+    processor.process_all()
+
+    enqueue("Insufficient funds", operation=TransactionType.WITHDRAWAL, sender_id=empty.uuid)
+    processor.process_all()
+    now += timedelta(minutes=1)
+    adapter.failures_remaining = 1
+    enqueue("External transfer succeeds after a temporary failure", external_recipient=external)
+    processor.process_all()
+    now += timedelta(minutes=1)
+    processor.process_all()
+
+    for label, transaction in transactions:
+        print(f"  {label}: {transaction.status.value} | {transaction.failure_reason or '-'}")
+    print("\nSuspicious operations (analysis events, including rechecks):")
+    for entry in audit.get_suspicious_operations():
+        details = entry["details"]
+        print(f"  {entry['transaction_id'][-8:]} | {details['risk_level']} | {', '.join(details['reasons'])}")
+    print(f"\nClient risk profile: {risk.get_client_risk_profile(ivan.client_id)}")
+    print(f"Error statistics: {audit.get_error_statistics()}")
+    print(f"Sender balance: {sender._balance} RUB | Waiting: {len(queue)}")
+    print(f"Audit file: {audit.file_path.resolve()}")
+
+
 def main() -> None:
     now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
     bank = Bank("ItGrind Bank", clock=lambda: now)
@@ -147,6 +232,7 @@ def main() -> None:
     for event in bank.suspicious_activities:
         print(f"  - {event}")
     demonstrate_transactions()
+    demonstrate_audit_and_risk()
 
 
 if __name__ == "__main__":
