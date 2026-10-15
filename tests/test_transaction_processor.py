@@ -1,3 +1,4 @@
+from copy import copy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
@@ -11,17 +12,16 @@ from src.investment_account import InvestmentAccount
 from src.models import AccountStatus, BankAccount, Currency
 from src.premium_account import PremiumAccount
 from src.savings_account import SavingsAccount
-from src.transaction import Transaction, TransactionStatus, TransactionType
-from src.transaction_processor import TransactionProcessor
+from src.transaction import ExternalRecipient, Transaction, TransactionStatus, TransactionType
+from src.transaction_processor import ExternalTransferAdapter, TransactionProcessor
 from src.transaction_queue import TransactionQueue
-
 
 NOW = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
 
 
 @pytest.fixture
 def system():
-    bank = Bank("Day 4 Bank")
+    bank = Bank("Day 4 Bank", clock=lambda: NOW)
     ivan = Client("Ivan", date(1990, 1, 1), {"email": "ivan@example.com"}, "secret")
     maria = Client("Maria", date(1990, 1, 1), {"email": "maria@example.com"}, "secret")
     bank.add_client(ivan)
@@ -29,10 +29,9 @@ def system():
     sender = BankAccount(ivan.full_name)
     recipient = BankAccount(maria.full_name)
     queue = TransactionQueue()
-    with patch.object(bank, "_get_current_time", return_value=NOW):
-        bank.open_account(ivan.client_id, sender)
-        bank.open_account(maria.client_id, recipient)
-        yield bank, ivan, maria, sender, recipient, queue, TransactionProcessor(bank, queue)
+    bank.open_account(ivan.client_id, sender)
+    bank.open_account(maria.client_id, recipient)
+    return bank, ivan, maria, sender, recipient, queue, TransactionProcessor(bank, queue)
 
 
 def transfer(system, **changes):
@@ -46,6 +45,9 @@ def transfer(system, **changes):
         recipient_id=recipient.uuid,
     )
     values.update(changes)
+    if values.get("is_external"):
+        values["recipient_id"] = None
+        values.setdefault("external_recipient", ExternalRecipient("OTHER-BANK", "EXT-1", Currency.RUB))
     return Transaction(**values)
 
 
@@ -76,10 +78,10 @@ def test_ten_transactions_complete_with_expected_balances(system):
         queue.add(transaction)
     assert len(processor.process_all(NOW)) == 9
     assert [item.status for item in transactions] == (
-        [TransactionStatus.COMPLETED] * 6 + [TransactionStatus.FAILED] * 3 + [TransactionStatus.PENDING]
+            [TransactionStatus.COMPLETED] * 6 + [TransactionStatus.FAILED] * 3 + [TransactionStatus.PENDING]
     )
     assert sender._balance == Decimal("509")
-    assert recipient._balance == Decimal("400")
+    assert recipient._balance == Decimal("200")
     assert usd._balance == Decimal("1")
     assert premium._balance == Decimal("-201")
     assert savings._balance == Decimal("200")
@@ -92,26 +94,29 @@ def test_ten_transactions_complete_with_expected_balances(system):
     ]
     assert transactions[6].failure_reason == "Withdrawal would violate minimum balance"
     assert transactions[8].failure_reason == "Insufficient funds"
+    for transaction in (transactions[3], transactions[5]):
+        assert processor.external_adapter.get_receipt(transaction.id)["amount"] == Decimal("100")
     assert len(processor.errors) == 3
     assert processor.process_all(NOW + timedelta(hours=1)) == [transactions[-1]]
     assert sender._balance == Decimal("459")
-    assert recipient._balance == Decimal("450")
+    assert recipient._balance == Decimal("250")
     assert len(queue) == 0
     assert processor.process_all(NOW + timedelta(days=1)) == []
 
 
 def test_currency_conversion_and_fee_rounding(system):
-    bank, ivan, maria, sender, _, queue, processor = system
-    usd = BankAccount(maria.full_name, Currency.USD)
-    bank.open_account(maria.client_id, usd)
+    bank, ivan, _, sender, recipient, queue, processor = system
     bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
-    transaction = transfer(system, amount=Decimal("100.50"), recipient_id=usd.uuid, is_external=True)
+    external = ExternalRecipient("FOREIGN-BANK", "USD-ACCOUNT", Currency.USD)
+    transaction = transfer(system, amount=Decimal("100.50"), is_external=True, external_recipient=external)
     queue.add(transaction)
     processor.process_all(NOW)
     assert transaction.status is TransactionStatus.COMPLETED
     assert transaction.fee == Decimal("1.01")
     assert sender._balance == Decimal("98.49")
-    assert usd._balance == Decimal("1.12")
+    assert recipient._balance == 0
+    assert processor.external_adapter.get_receipt(transaction.id)["amount"] == Decimal("1.12")
+    assert transaction.external_reference is not None
     assert transaction.recipient_amount == Decimal("1.12")
     assert transaction.recipient_currency is Currency.USD
     assert transaction.exchange_rate == Decimal("1") / Decimal("90")
@@ -236,7 +241,8 @@ def test_premium_can_transfer_from_negative_balance_and_respects_overdraft(syste
     assert second.status is TransactionStatus.FAILED
     assert second.errors[-1]["error_type"] == "InsufficientFundsError"
     assert premium._balance == Decimal("-401")
-    assert recipient._balance == Decimal("100")
+    assert recipient._balance == 0
+    assert processor.external_adapter.get_receipt(first.id)["amount"] == Decimal("100")
 
 
 def test_investment_transfer_uses_only_available_money(system):
@@ -258,13 +264,14 @@ def test_investment_transfer_uses_only_available_money(system):
 def test_temporary_failures_retry_three_times_and_stop(system):
     bank, ivan, _, sender, recipient, queue, processor = system
     bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
-    transaction = transfer(system)
+    transaction = transfer(system, is_external=True)
     queue.add(transaction)
-    with patch.object(bank, "execute_transaction", side_effect=TemporaryTransactionError("busy")) as execute:
-        for attempt in range(3):
-            processor.process_all(NOW + timedelta(minutes=attempt))
-        assert execute.call_count == 3
-        assert processor.process_all(NOW + timedelta(hours=1)) == []
+    processor.external_adapter = ExternalTransferAdapter(failures_remaining=3)
+    for attempt in range(3):
+        processor.process_all(NOW + timedelta(minutes=attempt))
+    assert processor.external_adapter.failures_remaining == 0
+    assert processor.external_adapter.get_receipt(transaction.id) is None
+    assert processor.process_all(NOW + timedelta(hours=1)) == []
     assert transaction.status is TransactionStatus.FAILED
     assert transaction.attempts == 3
     assert transaction.completed_at == NOW + timedelta(minutes=2)
@@ -276,7 +283,7 @@ def test_temporary_failures_retry_three_times_and_stop(system):
 def test_retry_rolls_back_both_balances_and_can_succeed(system):
     bank, ivan, _, sender, recipient, queue, processor = system
     bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
-    transaction = transfer(system, is_external=True)
+    transaction = transfer(system)
     queue.add(transaction)
     original_deposit = recipient.deposit
 
@@ -296,7 +303,7 @@ def test_retry_rolls_back_both_balances_and_can_succeed(system):
     assert transaction.failure_reason is None
     assert transaction.started_at == NOW
     assert transaction.last_attempt_at == transaction.completed_at == NOW + timedelta(minutes=1)
-    assert sender._balance == Decimal("99")
+    assert sender._balance == Decimal("100")
     assert recipient._balance == Decimal("100")
     assert len(transaction.errors) == 1
 
@@ -315,8 +322,8 @@ def test_lost_acknowledgement_never_reapplies_committed_operation(system, operat
     queue.add(transaction)
     original_execute = bank.execute_transaction
 
-    def lost_ack(*args):
-        original_execute(*args)
+    def lost_ack(*args, **kwargs):
+        original_execute(*args, **kwargs)
         raise TimeoutError("result lost after commit")
 
     with patch.object(bank, "execute_transaction", side_effect=lost_ack):
@@ -337,11 +344,8 @@ def test_lost_acknowledgement_never_reapplies_committed_operation(system, operat
         TransactionType.TRANSFER: (Decimal("100"), Decimal("100")),
     }[operation]
     # Even a second processor / queue with the same ID cannot move money twice.
-    duplicate = transfer(
-        system, transaction_type=operation, sender_id=transaction.sender_id,
-        recipient_id=transaction.recipient_id,
-    )
-    duplicate.id = transaction.id
+    duplicate = copy(transaction)
+    duplicate.status = TransactionStatus.PENDING
     other_queue = TransactionQueue()
     other_queue.add(duplicate)
     TransactionProcessor(bank, other_queue).process_all(NOW + timedelta(minutes=2))
@@ -358,15 +362,16 @@ def test_night_restriction_waits_until_five_without_spending_attempts(system, ho
     morning = night.replace(hour=5, minute=0, second=0)
     transaction = transfer(system)
     queue.add(transaction)
-    with patch.object(bank, "_get_current_time", return_value=night):
-        processor.process_all(night)
+    bank.clock = lambda: night
+    processor.process_all()
     assert transaction.status is TransactionStatus.RETRY_WAIT
-    assert transaction.scheduled_at == morning
+    assert transaction.retry_at == morning
+    assert transaction.scheduled_at is None
     assert transaction.attempts == 0
     assert sender._balance == Decimal("200")
     assert recipient._balance == 0
-    with patch.object(bank, "_get_current_time", return_value=morning):
-        processor.process_all(morning)
+    bank.clock = lambda: morning
+    processor.process_all()
     assert transaction.status is TransactionStatus.COMPLETED
     assert transaction.attempts == 1
     assert sender._balance == Decimal("100")
@@ -428,11 +433,11 @@ def test_third_attempt_recovers_committed_result_after_lost_response(system):
     original = bank.execute_transaction
     calls = 0
 
-    def unreliable_execute(*args):
+    def unreliable_execute(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 3:
-            original(*args)
+            original(*args, **kwargs)
         raise TimeoutError("unavailable response")
 
     with patch.object(bank, "execute_transaction", side_effect=unreliable_execute):
@@ -443,3 +448,175 @@ def test_third_attempt_recovers_committed_result_after_lost_response(system):
     assert len(transaction.errors) == 3
     assert transaction.fee == 0
     assert sender._balance == recipient._balance == Decimal("100")
+
+
+def test_subcent_transfer_is_rejected_instead_of_creating_money(system):
+    bank, ivan, _, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("1"))
+    with pytest.raises(InvalidOperationError, match="multiple of 0.01"):
+        queue.add(transfer(system, amount=Decimal("0.005")))
+    assert processor.process_all() == []
+    assert sender._balance + recipient._balance == Decimal("1")
+
+
+@pytest.mark.parametrize("operation", ["deposit", "withdraw", "invest"])
+def test_direct_money_operations_also_reject_subcent_amounts(system, operation):
+    bank, ivan, _, _, _, _, _ = system
+    account = InvestmentAccount(ivan.full_name)
+    bank.open_account(ivan.client_id, account)
+    bank.deposit(ivan.client_id, account.uuid, Decimal("1"))
+    with pytest.raises(InvalidOperationError, match="multiple of 0.01"):
+        if operation == "invest":
+            bank.invest(ivan.client_id, account.uuid, "stocks", Decimal("0.005"))
+        else:
+            getattr(bank, operation)(ivan.client_id, account.uuid, Decimal("0.005"))
+    assert account._balance == Decimal("1")
+    assert sum(account._portfolio.values()) == 0
+
+
+def test_same_currency_transfer_preserves_money_and_accepts_trailing_zeros(system):
+    bank, ivan, _, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("1"))
+    transaction = transfer(system, amount=Decimal("0.0100"))
+    queue.add(transaction)
+    processor.process_all()
+    assert transaction.status is TransactionStatus.COMPLETED
+    assert transaction.amount == transaction.recipient_amount == Decimal("0.01")
+    assert transaction.amount.as_tuple().exponent == -4
+    assert sender._balance == Decimal("0.99")
+    assert recipient._balance == Decimal("0.01")
+    assert sender._balance + recipient._balance == Decimal("1")
+
+
+def test_queued_payment_keeps_original_instructions_and_identity(system):
+    bank, ivan, maria, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("100"))
+    transaction = transfer(system, amount=Decimal("10"))
+    original_id = transaction.id
+    queue.add(transaction)
+    attempted_changes = {
+        "amount": Decimal("90"), "recipient_id": "another-account",
+        "sender_id": "another-sender", "client_id": maria.client_id,
+        "is_external": True, "id": "another-id", "currency": Currency.USD,
+        "transaction_type": TransactionType.WITHDRAWAL, "priority": 999,
+        "scheduled_at": NOW + timedelta(days=1),
+        "external_recipient": ExternalRecipient("OTHER", "EXT-2", Currency.USD),
+    }
+    for field, value in attempted_changes.items():
+        with pytest.raises(AttributeError, match="immutable"):
+            setattr(transaction, field, value)
+    processor.process_all()
+    assert transaction.id == original_id
+    assert transaction.status is TransactionStatus.COMPLETED
+    assert sender._balance == Decimal("90")
+    assert recipient._balance == Decimal("10")
+
+
+def test_external_transfer_retries_without_local_recipient_or_double_fee(system):
+    bank, ivan, _, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
+    transaction = transfer(system, is_external=True)
+    queue.add(transaction)
+    processor.external_adapter = ExternalTransferAdapter(failures_remaining=1)
+    processor.process_all()
+    assert transaction.status is TransactionStatus.RETRY_WAIT
+    assert sender._balance == Decimal("200")
+    assert processor.external_adapter.get_receipt(transaction.id) is None
+    assert transaction.scheduled_at is None
+    bank.clock = lambda: NOW + timedelta(seconds=59)
+    assert processor.process_all() == []
+    bank.clock = lambda: NOW + timedelta(minutes=1)
+    processor.process_all()
+    assert transaction.status is TransactionStatus.COMPLETED
+    assert transaction.attempts == 2
+    assert transaction.fee == Decimal("1")
+    assert sender._balance == Decimal("99")
+    assert recipient._balance == 0
+    assert len(bank.search_accounts()) == 2
+    receipt = processor.external_adapter.get_receipt(transaction.id)
+    assert receipt["recipient"] == transaction.external_recipient
+    assert receipt["amount"] == Decimal("100")
+    assert transaction.external_reference == receipt["reference"]
+    assert processor.process_all() == []
+    assert sender._balance == Decimal("99")
+
+
+def test_external_acceptance_with_lost_response_keeps_exactly_one_debit(system):
+    bank, ivan, _, sender, _, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
+    transaction = transfer(system, is_external=True)
+    queue.add(transaction)
+    original = processor.external_adapter.send
+
+    def lose_response(*args, **kwargs):
+        original(*args, **kwargs)
+        raise TimeoutError("External acceptance response lost")
+
+    with patch.object(processor.external_adapter, "send", side_effect=lose_response) as send:
+        processor.process_all()
+        assert send.call_count == 1
+    assert transaction.status is TransactionStatus.COMPLETED
+    assert transaction.errors[-1]["error_type"] == "TimeoutError"
+    assert sender._balance == Decimal("99")
+    reference = transaction.external_reference
+    duplicate = copy(transaction)
+    duplicate.status = TransactionStatus.PENDING
+    other_queue = TransactionQueue()
+    other_queue.add(duplicate)
+    TransactionProcessor(bank, other_queue, processor.external_adapter).process_all()
+    assert duplicate.status is TransactionStatus.COMPLETED
+    assert duplicate.external_reference == reference
+    assert sender._balance == Decimal("99")
+    assert processor.external_adapter.get_receipt(transaction.id)["amount"] == Decimal("100")
+
+
+def test_shared_clock_defers_until_bank_local_morning_and_preserves_schedule(system):
+    bank, ivan, _, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
+    night = datetime(2026, 10, 15, 23, tzinfo=timezone.utc)  # 02:00 on Oct 16 in bank timezone.
+    morning = datetime(2026, 10, 16, 2, tzinfo=timezone.utc)  # 05:00 UTC+03:00.
+    transaction = transfer(system, scheduled_at=night)
+    queue.add(transaction)
+    bank.clock = lambda: night
+    processor.process_all()
+    assert transaction.status is TransactionStatus.RETRY_WAIT
+    assert transaction.retry_at == morning
+    assert transaction.scheduled_at == night
+    assert transaction.attempts == 0
+    bank.clock = lambda: morning - timedelta(seconds=1)
+    assert processor.process_all() == []
+    bank.clock = lambda: morning
+    processor.process_all()
+    assert transaction.status is TransactionStatus.COMPLETED
+    assert transaction.completed_at == morning
+    assert transaction.last_attempt_at == morning
+    assert transaction.scheduled_at == night
+    assert sender._balance == recipient._balance == Decimal("100")
+
+
+def test_explicit_processing_time_is_used_for_bank_checks_too(system):
+    bank, ivan, _, sender, recipient, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
+    queue.add(transfer(system))
+    bank.clock = lambda: datetime(2026, 10, 15, 23, tzinfo=timezone.utc)
+    processed = processor.process_all(NOW)
+    assert processed[0].status is TransactionStatus.COMPLETED
+    assert sender._balance == recipient._balance == Decimal("100")
+
+
+def test_cancelling_waiting_retry_uses_the_same_clock(system):
+    bank, ivan, _, sender, _, queue, processor = system
+    bank.deposit(ivan.client_id, sender.uuid, Decimal("200"))
+    transaction = transfer(system, is_external=True)
+    queue.add(transaction)
+    processor.external_adapter = ExternalTransferAdapter(failures_remaining=1)
+    processor.process_all()
+    cancellation_time = NOW + timedelta(seconds=30)
+    bank.clock = lambda: cancellation_time
+    queue.cancel(transaction.id)
+    assert transaction.status is TransactionStatus.CANCELLED
+    assert transaction.completed_at == cancellation_time
+    bank.clock = lambda: NOW + timedelta(minutes=1)
+    assert processor.process_all() == []
+    assert sender._balance == Decimal("200")
+    assert processor.external_adapter.get_receipt(transaction.id) is None

@@ -1,5 +1,4 @@
-﻿"""Premium fees, withdrawal limits and overdraft."""
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pytest
 

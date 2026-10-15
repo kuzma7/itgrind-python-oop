@@ -1,5 +1,4 @@
-﻿"""Savings minimum balance and interest accrual."""
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pytest
 

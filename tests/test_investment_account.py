@@ -1,5 +1,4 @@
-﻿"""Investing available funds and calculating portfolio returns."""
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pytest
 

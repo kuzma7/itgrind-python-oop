@@ -66,7 +66,7 @@ Supported operations:
 - Restrictions on account-management operations from **00:00 to 05:00**.
 - Prevention of invalid account status transitions.
 
-The nighttime restriction applies to account management and money operations through `Bank`, using the bank's local time. Registered accounts reject direct money operations; they must go through `Bank`.
+The nighttime restriction applies to account management and money operations through `Bank`. The working timezone is explicitly UTC+03:00 by default (`bank_timezone`), independent of the computer's timezone. Registered accounts reject direct money operations; they must go through `Bank`.
 
 **Note:** This is an educational in-memory application, not a production banking or authentication system.
 
@@ -85,32 +85,34 @@ Different currencies are calculated separately without automatic conversion.
 
 Only three new source modules are used: `transaction.py`, `transaction_queue.py`, and `transaction_processor.py`. Processing is single-threaded, with an ordinary list and no database or external services.
 
-`Transaction` stores a full UUID, operation type (`DEPOSIT`, `WITHDRAWAL`, `TRANSFER`), client ID, sender/recipient account IDs, amount, currency, charged fee, status, failure reason, and UTC timestamps. It also stores priority, schedule, attempt count, error history, and conversion results. A deposit requires only a recipient, a withdrawal only a sender, and a transfer two distinct accounts.
+`Transaction` separates immutable instructions (`TransactionDetails`, a frozen dataclass) from mutable processing results. ID, type, client, amount, currency, endpoints, external flag, priority and original schedule cannot be changed after creation, including after enqueueing. A deposit requires only a local recipient, a withdrawal only a sender, and an internal transfer two distinct accounts. An external transfer requires a sender and immutable `ExternalRecipient(bank_code, account_number, currency)` details instead of a local recipient ID. Results include status, charged fee, failure reason, UTC timestamps, attempts, errors, conversion details and the external payment reference.
 
-`TransactionQueue` provides `add(transaction)`, `get_next(now=None)`, and `cancel(transaction_id)`. Higher integer priorities run first; equal priorities preserve insertion order. Scheduled operations wait until `scheduled_at`, which must include a timezone; past dates are allowed. `get_next` claims an operation by setting `PROCESSING`. Only `PENDING` and `RETRY_WAIT` operations can be cancelled. `len(queue)` counts waiting operations, including future ones. Results remain in the queue's list for duplicate-ID protection.
+`TransactionQueue` provides `add(transaction)`, `get_next(now=None)`, and `cancel(transaction_id)`. Higher integer priorities run first; equal priorities preserve insertion order. Scheduled operations wait until `scheduled_at`, which must include a timezone; past dates are allowed. Retries additionally wait for the separate `retry_at` result field, preserving the original schedule. `get_next` claims an operation by setting `PROCESSING`. Only `PENDING` and `RETRY_WAIT` operations can be cancelled. `len(queue)` counts waiting operations, including future ones. Results remain in the queue's list for duplicate-ID protection.
 
-`TransactionProcessor(bank, queue)` provides `process_next(now=None)` and `process_all(now=None)`. A pass processes ready work and returns without sleeping when only future work remains. Call it again when the next schedule arrives. The optional `now` controls queue eligibility and result timestamps; bank access restrictions independently use the bank's clock.
+`TransactionProcessor(bank, queue, external_adapter=None)` provides `process_next(now=None)` and `process_all(now=None)`. A pass processes ready work and returns without sleeping when only future work remains. Call it again when the next schedule arrives. `Bank(clock=...)` accepts one callable returning an aware datetime; the processor connects the queue to that same clock, including cancellation timestamps. Each processing attempt uses one time snapshot for both queue eligibility and bank checks. An explicit `now` overrides that snapshot for both components, avoiding contradictory schedules and bank restrictions.
+
+`ExternalTransferAdapter` in `transaction_processor.py` simulates another bank without registering its recipient in `Bank._accounts`. It records accepted payments and references by transaction ID. `failures_remaining` can simulate temporary unavailability before acceptance. If an acceptance response is lost, the processor checks the matching receipt and completes the payment without a second debit or external credit. This is an in-memory simulator, not a connection to a real bank.
 
 Business rules:
 
-- All amounts are positive finite `Decimal` values. Deposit and withdrawal currencies must match their account. A transfer amount and its fee are in the sender's currency.
-- Internal transfers have no percentage fee. An external transfer (`is_external=True`) charges **1%**, rounded to cents with `ROUND_HALF_UP`, in addition to the principal. Both endpoints are registered accounts in this educational bank; no real external bank connection is involved.
+- Input monetary amounts must be positive finite `Decimal` values and exact multiples of `0.01` for every supported currency. Fractions such as `0.005` are rejected, never silently rounded; trailing zeros such as `0.0100` are allowed. This rule also applies to direct account deposits, withdrawals and investments. Deposit and withdrawal currencies must match their account. A transfer amount and its fee are in the sender's currency.
+- Internal transfers have no percentage fee. An external transfer (`is_external=True`) charges **1%**, rounded to cents with `ROUND_HALF_UP`, in addition to the principal. Its recipient has external bank/account details and a currency; a local recipient ID is not permitted or required.
 - Existing account rules remain active. Premium withdrawals/transfers also charge the Day 3 fixed fee once; `transaction.fee` reports the total charged fee. For a Premium transfer, the withdrawal limit applies to principal plus external fee, and the overdraft check also includes the fixed fee. Savings minimum balances and investment available balances are respected.
 - Frozen or closed sender/recipient accounts reject money operations. The initiating client must be active and own the debited account (or the credited account for a deposit). Only Premium accounts may transfer from a negative balance and use overdraft, within its limit.
-- Fixed educational quotes, in RUB per currency unit: RUB `1`, USD `90`, EUR `100`, KZT `0.20`, CNY `12.50`. Conversion uses `source_quote / target_quote`; the recipient amount is rounded to cents with `ROUND_HALF_UP`. Amounts rounding to zero are rejected. These are illustrative constants, not live exchange rates.
+- Fixed educational quotes, in RUB per currency unit: RUB `1`, USD `90`, EUR `100`, KZT `0.20`, CNY `12.50`. Conversion uses `source_quote / target_quote`; only the converted recipient amount is rounded to cents with `ROUND_HALF_UP`. Same-currency transfers credit the exact original amount. Original amount and exchange rate remain available in the result. Amounts converting to zero are rejected. These are illustrative constants, not live exchange rates.
 - Temporary failures (`TemporaryTransactionError`, `TimeoutError`, `ConnectionError`) wait one minute before the next attempt. There are at most **3 attempts total**, including the first. Business errors and unexpected errors are logged and fail immediately.
-- A nighttime restriction sets `RETRY_WAIT` until 05:00 in the bank's local time, without consuming the temporary-error attempt budget. Waiting operations are retained and can be cancelled.
+- A nighttime restriction sets `RETRY_WAIT` and `retry_at` until 05:00 in the bank's configured timezone, without consuming the temporary-error attempt budget or overwriting `scheduled_at`. Waiting operations are retained and can be cancelled.
 - Failed operations restore account balances. Successful results are remembered by transaction ID in `Bank`, so even a retry after a lost response does not debit twice. If a response fails after commit, the processor retrieves the recorded result and marks the operation completed immediately. Completed, failed, and cancelled operations are not selected again.
 - `transaction.errors` and `processor.errors` record the transaction ID, attempt, timestamp, exception type, and message. A successful retry clears `failure_reason` but preserves the error history.
 
-This atomicity and duplicate protection apply within the lifetime of one in-memory `Bank`. Queue state and committed IDs are not persisted across application restarts.
+This atomicity and duplicate protection apply within the lifetime of the in-memory bank and external simulator. Queue state, committed IDs and external receipts are not persisted across application restarts; this does not implement distributed transactions with a real bank.
 
 Example (with registered active clients/accounts, during permitted bank hours):
 
 ```python
 from decimal import Decimal
 from src.models import Currency
-from src.transaction import Transaction, TransactionType
+from src.transaction import ExternalRecipient, Transaction, TransactionType
 from src.transaction_queue import TransactionQueue
 from src.transaction_processor import TransactionProcessor
 
@@ -121,14 +123,17 @@ transaction = Transaction(
     amount=Decimal("5000.00"),
     currency=Currency.RUB,
     sender_id=ivan_account.uuid,
-    recipient_id=maria_account.uuid,
     is_external=True,
+    external_recipient=ExternalRecipient("OTHER-BANK", "EXTERNAL-ACCOUNT-001", Currency.USD),
 )
 queue.add(transaction)
 processor = TransactionProcessor(bank, queue)
 processor.process_all()
 print(transaction.status.value, transaction.fee)
+print(transaction.recipient_amount, transaction.recipient_currency, transaction.external_reference)
 ```
+
+For an internal transfer, use `recipient_id=maria_account.uuid`, leave `is_external=False`, and omit `external_recipient`.
 
 ## Project Structure
 
@@ -209,7 +214,7 @@ The demonstration includes:
 - Client authentication and account blocking.
 - Nighttime operation restrictions.
 - Searching accounts and calculating financial statistics.
-- Creating and queuing **10 transactions**: deposits, withdrawals, internal/external transfers, conversion, Premium overdraft, insufficient funds, a frozen recipient, cancellation, and a deferred deposit. A controlled clock advances the schedule without sleeping. Final results: 7 completed, 2 failed, 1 cancelled.
+- Creating and queuing **10 transactions**: deposits, withdrawals, internal/external transfers, conversion, Premium overdraft, insufficient funds, a frozen recipient, cancellation, a deferred deposit and a temporary external-bank failure followed by a retry. Advancing one injected clock advances schedules and bank checks without sleeping or patching methods. Final results: 7 completed, 2 failed, 1 cancelled.
 
 ## Testing
 
@@ -242,7 +247,7 @@ Tests focus on observable business scenarios: balance changes, financial limits,
 | `test_transaction_queue.py` | Priority/FIFO, scheduling with timezones, cancellation, duplicate and finished-operation rejection |
 | `test_transaction_processor.py` | Ten-operation batch, fees, actual converted balances, access restrictions, retries, rollback, error records and duplicate-debit prevention |
 
-Day 4 tests also check a batch of ten transactions, priorities, schedules, cancellation, fees, conversion, access restrictions, overdraft, atomic rollback, bounded retries, nighttime deferral, and duplicate protection after a lost acknowledgement.
+Day 4 tests also check a batch of ten transactions, priorities, schedules, cancellation, fees, conversion, access restrictions, overdraft, atomic rollback, bounded retries, nighttime deferral, and duplicate protection after a lost acknowledgement. Regression scenarios cover rejection of sub-cent amounts, conservation of funds for same-currency transfers, immutable queued instructions, external payments without a local recipient, external lost-response recovery and a shared clock crossing the bank's 05:00 boundary.
 
 ## OOP Concepts
 

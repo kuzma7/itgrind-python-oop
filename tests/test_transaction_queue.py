@@ -1,6 +1,6 @@
-﻿"""Queue ordering, scheduling, cancellation and duplicate protection."""
-from datetime import datetime, timedelta, timezone
+﻿from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from copy import copy
 
 import pytest
 
@@ -8,7 +8,6 @@ from src.exceptions import InvalidOperationError
 from src.models import Currency
 from src.transaction import Transaction, TransactionStatus, TransactionType
 from src.transaction_queue import TransactionQueue
-
 
 NOW = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
 
@@ -82,8 +81,7 @@ def test_duplicate_transaction_id_cannot_enter_queue_twice():
     queue = TransactionQueue()
     transaction = make_transaction()
     queue.add(transaction)
-    duplicate = make_transaction()
-    duplicate.id = transaction.id
+    duplicate = copy(transaction)
     for repeated in (transaction, duplicate):
         with pytest.raises(InvalidOperationError, match="Transaction already exists in queue"):
             queue.add(repeated)

@@ -1,18 +1,26 @@
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Callable
 
 from src.client import Client, ClientStatus
 from src.exceptions import BankOperationRestrictedError, InvalidOperationError
 from src.investment_account import InvestmentAccount
-from src.models import BankAccount, AccountStatus, Currency, _bank_operation_token
+from src.models import BankAccount, AccountStatus, Currency, _bank_operation_token, validate_money_precision
 from src.premium_account import PremiumAccount
 from src.transaction import Transaction, TransactionStatus, TransactionType
 
 
 class Bank:
-    def __init__(self, name: str):
+    def __init__(
+            self,
+            name: str,
+            clock: Callable[[], datetime] | None = None,
+            bank_timezone: tzinfo = timezone(timedelta(hours=3), "UTC+03:00"),
+    ):
         self.name = name
+        self.clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
+        self.bank_timezone = bank_timezone
         self._clients: dict[str, Client] = {}
         self._accounts: dict[str, BankAccount] = {}
         self.suspicious_activities: list[str] = []
@@ -50,8 +58,10 @@ class Bank:
         client.account_ids.append(account.uuid)
         account._bank_token = self._operation_token
 
-    def _validate_account_access(self, client_id: str, account_id: str, operation: str) -> BankAccount:
-        self._validate_operation_time(operation)
+    def _validate_account_access(
+            self, client_id: str, account_id: str, operation: str, now: datetime | None = None,
+    ) -> BankAccount:
+        self._validate_operation_time(operation, now)
         if client_id not in self._clients:
             raise InvalidOperationError("Client not found")
         client = self._clients[client_id]
@@ -89,16 +99,14 @@ class Bank:
         return result.copy() if result is not None else None
 
     def execute_transaction(
-        self,
-        transaction: Transaction,
-        external_fee: Decimal = Decimal("0.00"),
-        exchange_rate: Decimal = Decimal("1"),
+            self,
+            transaction: Transaction,
+            external_fee: Decimal = Decimal("0.00"),
+            exchange_rate: Decimal = Decimal("1"),
+            *,
+            now: datetime | None = None,
+            external_send: Callable[[Transaction, Decimal], dict] | None = None,
     ) -> dict:
-        """Apply a transaction atomically and remember the committed result by ID.
-
-        The processor supplies the external fee and exchange rate. Account
-        methods still enforce their own withdrawal limits and fixed fees.
-        """
         if not isinstance(transaction, Transaction):
             raise InvalidOperationError("Expected Transaction instance")
         if transaction.status is not TransactionStatus.PROCESSING:
@@ -107,6 +115,7 @@ class Bank:
             return self._transaction_results[transaction.id].copy()
         if not isinstance(external_fee, Decimal) or not external_fee.is_finite() or external_fee < 0:
             raise InvalidOperationError("Invalid external fee")
+        validate_money_precision(external_fee)
         if not isinstance(exchange_rate, Decimal) or not exchange_rate.is_finite() or exchange_rate <= 0:
             raise InvalidOperationError("Invalid exchange rate")
         if not isinstance(transaction.transaction_type, TransactionType):
@@ -115,29 +124,39 @@ class Bank:
         is_transfer = transaction.transaction_type is TransactionType.TRANSFER
         if not is_transfer and external_fee != 0:
             raise InvalidOperationError("Only transfers can have an external fee")
+        if not transaction.is_external and external_fee != 0:
+            raise InvalidOperationError("Internal operations cannot have an external fee")
         account_id = (
             transaction.recipient_id if transaction.transaction_type is TransactionType.DEPOSIT
             else transaction.sender_id
         )
-        account = self._validate_account_access(transaction.client_id, account_id, "transaction")
+        account = self._validate_account_access(transaction.client_id, account_id, "transaction", now)
         if account.currency is not transaction.currency:
             raise InvalidOperationError("Transaction currency must match account currency")
         account._validate_amount(transaction.amount)
 
         recipient = None
         recipient_amount = None
+        recipient_currency = None
         if is_transfer:
-            if transaction.recipient_id == transaction.sender_id:
-                raise InvalidOperationError("Transfer requires two different accounts")
-            if transaction.recipient_id not in self._accounts:
-                raise InvalidOperationError("Recipient account not found")
-            recipient = self._accounts[transaction.recipient_id]
-            if recipient.currency is account.currency and exchange_rate != Decimal("1"):
+            if transaction.is_external:
+                if external_send is None:
+                    raise InvalidOperationError("External transfer adapter is required")
+                recipient_currency = transaction.external_recipient.currency
+            else:
+                if transaction.recipient_id == transaction.sender_id:
+                    raise InvalidOperationError("Transfer requires two different accounts")
+                if transaction.recipient_id not in self._accounts:
+                    raise InvalidOperationError("Recipient account not found")
+                recipient = self._accounts[transaction.recipient_id]
+                recipient_currency = recipient.currency
+            if recipient_currency is account.currency and exchange_rate != Decimal("1"):
                 raise InvalidOperationError("Same-currency exchange rate must be one")
-            recipient_amount = (transaction.amount * exchange_rate).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
+            recipient_amount = (
+                transaction.amount if recipient_currency is account.currency
+                else (transaction.amount * exchange_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             )
-            recipient._validate_amount(recipient_amount)
+            account._validate_amount(recipient_amount)
             if account._balance < 0 and not isinstance(account, PremiumAccount):
                 raise InvalidOperationError("Transfers from negative balances are prohibited")
 
@@ -159,13 +178,18 @@ class Bank:
                     account.withdraw(transaction.amount)
                 else:
                     account.withdraw(transaction.amount + external_fee)
-                    recipient.deposit(recipient_amount)
+                    if recipient is not None:
+                        recipient.deposit(recipient_amount)
                 result = {
                     "fee": fee,
                     "exchange_rate": exchange_rate if is_transfer else None,
                     "recipient_amount": recipient_amount,
-                    "recipient_currency": recipient.currency if recipient is not None else None,
+                    "recipient_currency": recipient_currency,
+                    "external_reference": None,
                 }
+                if transaction.is_external:
+                    receipt = external_send(transaction, recipient_amount)
+                    result["external_reference"] = receipt["reference"]
                 self._transaction_results[transaction.id] = result
             except Exception:
                 for changed_account, balance in balances:
@@ -283,10 +307,16 @@ class Bank:
         return result
 
     def _get_current_time(self) -> datetime:
-        return datetime.now().astimezone()
+        now = self.clock()
+        if not isinstance(now, datetime) or now.utcoffset() is None:
+            raise InvalidOperationError("Clock must return a timezone-aware datetime")
+        return now.astimezone(timezone.utc)
 
-    def _validate_operation_time(self, operation: str) -> None:
-        current_time = self._get_current_time()
+    def _validate_operation_time(self, operation: str, now: datetime | None = None) -> None:
+        current_time = now if now is not None else self._get_current_time()
+        if not isinstance(current_time, datetime) or current_time.utcoffset() is None:
+            raise InvalidOperationError("Current time must be a timezone-aware datetime")
+        current_time = current_time.astimezone(self.bank_timezone)
         if 0 <= current_time.hour < 5:
             self.suspicious_activities.append(
                 f"Restricted operation: {operation} at "

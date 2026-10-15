@@ -1,5 +1,4 @@
-﻿"""Business validation of transaction instructions."""
-from decimal import Decimal
+﻿from decimal import Decimal
 
 import pytest
 

@@ -46,6 +46,3 @@ class SavingsAccount(BankAccount):
     def __str__(self):
         parent_str = super().__str__()
         return parent_str + f"\nMin balance: {self.min_balance}\nMonthly rate: {self.monthly_rate * 100}%"
-
-
-
