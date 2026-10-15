@@ -1,4 +1,7 @@
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
+
+_bank_operation_token: ContextVar[object | None] = ContextVar("bank_operation_token", default=None)
 from enum import Enum
 import uuid
 from decimal import Decimal
@@ -72,8 +75,11 @@ class BankAccount(AbstractAccount):
 
         super().__init__(owner, account_id, status)
         self.currency = currency
+        self._bank_token: object | None = None
 
     def _validate_status(self):
+        if self._bank_token is not None and _bank_operation_token.get() is not self._bank_token:
+            raise InvalidOperationError("Use Bank for transactions on registered accounts")
         if self.account_status == AccountStatus.FROZEN:
             raise AccountFrozenError("Account is frozen")
 
