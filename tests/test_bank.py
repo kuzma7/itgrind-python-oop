@@ -72,9 +72,9 @@ def test_freeze_unfreeze_and_search_status(bank):
     assert account.account_status is AccountStatus.FROZEN
     assert bank.search_accounts(status=AccountStatus.FROZEN) == [account]
     with pytest.raises(AccountFrozenError):
-        account.deposit(Decimal("100"))
+        bank.deposit(client.client_id, account.uuid, Decimal("100"))
     bank.unfreeze_account(account.uuid)
-    account.deposit(Decimal("100"))
+    bank.deposit(client.client_id, account.uuid, Decimal("100"))
     assert account._balance == Decimal("100")
 
 
@@ -82,10 +82,10 @@ def test_close_account_only_when_empty_and_keep_history(bank):
     client = register(bank)
     account = BankAccount(owner=client.full_name)
     bank.open_account(client.client_id, account)
-    account.deposit(Decimal("100"))
+    bank.deposit(client.client_id, account.uuid, Decimal("100"))
     with pytest.raises(InvalidOperationError, match="balance must be zero"):
         bank.close_account(account.uuid)
-    account.withdraw(Decimal("100"))
+    bank.withdraw(client.client_id, account.uuid, Decimal("100"))
     bank.close_account(account.uuid)
     assert account.account_status is AccountStatus.CLOSED
     assert bank.search_accounts(status=AccountStatus.CLOSED) == [account]
@@ -97,8 +97,8 @@ def test_cannot_close_investment_with_portfolio(bank):
     client = register(bank)
     account = InvestmentAccount(owner=client.full_name)
     bank.open_account(client.client_id, account)
-    account.deposit(Decimal("1000"))
-    account.invest("stocks", Decimal("1000"))
+    bank.deposit(client.client_id, account.uuid, Decimal("1000"))
+    bank.invest(client.client_id, account.uuid, "stocks", Decimal("1000"))
     assert account._balance == 0
     with pytest.raises(InvalidOperationError, match="portfolio is not empty"):
         bank.close_account(account.uuid)
@@ -175,3 +175,61 @@ def test_totals_and_ranking_multiple_currencies(bank):
         (maria, Decimal("200")),
         (ivan, Decimal("0")),
     ]
+
+
+def test_registered_account_rejects_direct_money_operations(bank):
+    client = register(bank)
+    account = InvestmentAccount(owner=client.full_name)
+    bank.open_account(client.client_id, account)
+    with pytest.raises(InvalidOperationError, match="Use Bank"):
+        account.deposit(Decimal("100"))
+    with pytest.raises(InvalidOperationError, match="Use Bank"):
+        account.withdraw(Decimal("100"))
+    with pytest.raises(InvalidOperationError, match="Use Bank"):
+        account.invest("stocks", Decimal("100"))
+    assert account._balance == 0
+
+
+def test_money_operations_blocked_after_lockout(bank):
+    client = register(bank)
+    account = InvestmentAccount(owner=client.full_name)
+    bank.open_account(client.client_id, account)
+    bank.deposit(client.client_id, account.uuid, Decimal("500"))
+    for _ in range(2):
+        assert bank.authenticate_client(client.client_id, "wrong") is False
+    with pytest.raises(InvalidOperationError):
+        bank.authenticate_client(client.client_id, "wrong")
+    for call in (
+        lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
+        lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
+        lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
+    ):
+        with pytest.raises(InvalidOperationError, match="blocked"):
+            call()
+    assert account._balance == Decimal("500")
+    assert account._portfolio["stocks"] == 0
+
+
+def test_money_operations_restricted_at_night(bank):
+    client = register(bank)
+    account = InvestmentAccount(owner=client.full_name)
+    bank.open_account(client.client_id, account)
+    with patch.object(bank, "_get_current_time", return_value=datetime(2026, 10, 15, 2)):
+        for call in (
+            lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
+            lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
+            lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
+        ):
+            with pytest.raises(InvalidOperationError, match="00:00 to 05:00"):
+                call()
+    assert account._balance == 0
+
+
+def test_client_cannot_operate_someone_elses_account(bank):
+    ivan = register(bank)
+    maria = register(bank, "Maria Petrova")
+    account = BankAccount(owner=ivan.full_name)
+    bank.open_account(ivan.client_id, account)
+    with pytest.raises(InvalidOperationError, match="does not belong"):
+        bank.deposit(maria.client_id, account.uuid, Decimal("100"))
+    assert account._balance == 0

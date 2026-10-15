@@ -1,10 +1,11 @@
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 
 from src.client import Client, ClientStatus
 from src.exceptions import InvalidOperationError
 from src.investment_account import InvestmentAccount
-from src.models import BankAccount, AccountStatus, Currency
+from src.models import BankAccount, AccountStatus, Currency, _bank_operation_token
 
 
 class Bank:
@@ -13,6 +14,7 @@ class Bank:
         self._clients: dict[str, Client] = {}
         self._accounts: dict[str, BankAccount] = {}
         self.suspicious_activities: list[str] = []
+        self._operation_token = object()
 
     def add_client(self, client: Client) -> None:
         if not isinstance(client, Client):
@@ -32,12 +34,69 @@ class Bank:
         if not isinstance(account, BankAccount):
             raise InvalidOperationError("Invalid account")
         if account.uuid in self._accounts:
-            raise InvalidOperationError("Account exist")
-        if account.owner != self._clients[client_id].full_name:
+            raise InvalidOperationError("Account already exists")
+        client = self._clients[client_id]
+        if account.owner != client.full_name:
             raise InvalidOperationError("Account owner does not match client")
+        if account.account_status is not AccountStatus.ACTIVE:
+            raise InvalidOperationError("Only active accounts can be opened")
 
+        if account._bank_token is not None:
+            raise InvalidOperationError("Account already belongs to a bank")
         self._accounts[account.uuid] = account
-        self._clients[client_id].account_ids.append(account.uuid)
+        client.account_ids.append(account.uuid)
+        account._bank_token = self._operation_token
+
+    def _validate_account_access(self, client_id: str, account_id: str, operation: str) -> BankAccount:
+        self._validate_operation_time(operation)
+        if client_id not in self._clients:
+            raise InvalidOperationError("Client not found")
+        client = self._clients[client_id]
+        if client.status is ClientStatus.BLOCKED:
+            raise InvalidOperationError("Client is blocked")
+        if account_id not in self._accounts or account_id not in client.account_ids:
+            raise InvalidOperationError("Account not found or does not belong to client")
+        return self._accounts[account_id]
+
+    @contextmanager
+    def _authorize_account_operation(self):
+        token = _bank_operation_token.set(self._operation_token)
+        try:
+            yield
+        finally:
+            _bank_operation_token.reset(token)
+
+    def deposit(self, client_id: str, account_id: str, amount: Decimal) -> None:
+        account = self._validate_account_access(client_id, account_id, "deposit")
+        with self._authorize_account_operation():
+            account.deposit(amount)
+
+    def withdraw(self, client_id: str, account_id: str, amount: Decimal) -> None:
+        account = self._validate_account_access(client_id, account_id, "withdraw")
+        with self._authorize_account_operation():
+            account.withdraw(amount)
+
+    def invest(self, client_id: str, account_id: str, asset_type: str, amount: Decimal) -> None:
+        account = self._validate_account_access(client_id, account_id, "invest")
+        if not isinstance(account, InvestmentAccount):
+            raise InvalidOperationError("Investment operations require InvestmentAccount")
+        with self._authorize_account_operation():
+            account.invest(asset_type, amount)
+
+    def project_yearly_growth(self, client_id: str, account_id: str, growth_rates: dict[str, Decimal]) -> Decimal:
+        account = self._validate_account_access(client_id, account_id, "project_yearly_growth")
+        if not isinstance(account, InvestmentAccount):
+            raise InvalidOperationError("Growth projection requires InvestmentAccount")
+        with self._authorize_account_operation():
+            return account.project_yearly_growth(growth_rates)
+
+    def apply_monthly_interest(self, client_id: str, account_id: str) -> Decimal:
+        from src.savings_account import SavingsAccount
+        account = self._validate_account_access(client_id, account_id, "apply_monthly_interest")
+        if not isinstance(account, SavingsAccount):
+            raise InvalidOperationError("Interest operation requires SavingsAccount")
+        with self._authorize_account_operation():
+            return account.apply_monthly_interest()
 
     def freeze_account(self, account_id: str) -> None:
         self._validate_operation_time("freeze_account")
@@ -75,7 +134,7 @@ class Bank:
         if account._balance != Decimal("0.00"):
             raise InvalidOperationError("Account balance must be zero")
         if isinstance(account, InvestmentAccount):
-            portfolio_total = sum(account._portfolio.values(), Decimal("0.00"), )
+            portfolio_total = sum(account._portfolio.values(), Decimal("0.00"))
             if portfolio_total != Decimal("0.00"):
                 raise InvalidOperationError("Investment portfolio is not empty")
 
@@ -89,14 +148,21 @@ class Bank:
 
         if client.status is ClientStatus.BLOCKED:
             raise InvalidOperationError("Client is blocked")
+
         if client.verify_password(password):
             client.failed_login_attempts = 0
             return True
+
         client.failed_login_attempts += 1
+
         if client.failed_login_attempts >= 3:
             client.status = ClientStatus.BLOCKED
-            self.suspicious_activities.append(f"Client {client_id}: 3 failed login attempts")
-            raise InvalidOperationError("Client blocked after 3 failed login attempts")
+            self.suspicious_activities.append(
+                f"Client {client_id}: 3 failed login attempts"
+            )
+            raise InvalidOperationError(
+                "Client blocked after 3 failed login attempts"
+            )
 
         return False
 
