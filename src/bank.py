@@ -1,11 +1,13 @@
 from contextlib import contextmanager
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 from src.client import Client, ClientStatus
-from src.exceptions import InvalidOperationError
+from src.exceptions import BankOperationRestrictedError, InvalidOperationError
 from src.investment_account import InvestmentAccount
 from src.models import BankAccount, AccountStatus, Currency, _bank_operation_token
+from src.premium_account import PremiumAccount
+from src.transaction import Transaction, TransactionStatus, TransactionType
 
 
 class Bank:
@@ -15,6 +17,7 @@ class Bank:
         self._accounts: dict[str, BankAccount] = {}
         self.suspicious_activities: list[str] = []
         self._operation_token = object()
+        self._transaction_results: dict[str, dict] = {}
 
     def add_client(self, client: Client) -> None:
         if not isinstance(client, Client):
@@ -75,6 +78,100 @@ class Bank:
         account = self._validate_account_access(client_id, account_id, "withdraw")
         with self._authorize_account_operation():
             account.withdraw(amount)
+
+    def get_account_currency(self, account_id: str) -> Currency:
+        if account_id not in self._accounts:
+            raise InvalidOperationError("Account not found")
+        return self._accounts[account_id].currency
+
+    def get_transaction_result(self, transaction_id: str) -> dict | None:
+        result = self._transaction_results.get(transaction_id)
+        return result.copy() if result is not None else None
+
+    def execute_transaction(
+        self,
+        transaction: Transaction,
+        external_fee: Decimal = Decimal("0.00"),
+        exchange_rate: Decimal = Decimal("1"),
+    ) -> dict:
+        """Apply a transaction atomically and remember the committed result by ID.
+
+        The processor supplies the external fee and exchange rate. Account
+        methods still enforce their own withdrawal limits and fixed fees.
+        """
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError("Expected Transaction instance")
+        if transaction.status is not TransactionStatus.PROCESSING:
+            raise InvalidOperationError("Transaction must be processing")
+        if transaction.id in self._transaction_results:
+            return self._transaction_results[transaction.id].copy()
+        if not isinstance(external_fee, Decimal) or not external_fee.is_finite() or external_fee < 0:
+            raise InvalidOperationError("Invalid external fee")
+        if not isinstance(exchange_rate, Decimal) or not exchange_rate.is_finite() or exchange_rate <= 0:
+            raise InvalidOperationError("Invalid exchange rate")
+        if not isinstance(transaction.transaction_type, TransactionType):
+            raise InvalidOperationError("Invalid transaction type")
+
+        is_transfer = transaction.transaction_type is TransactionType.TRANSFER
+        if not is_transfer and external_fee != 0:
+            raise InvalidOperationError("Only transfers can have an external fee")
+        account_id = (
+            transaction.recipient_id if transaction.transaction_type is TransactionType.DEPOSIT
+            else transaction.sender_id
+        )
+        account = self._validate_account_access(transaction.client_id, account_id, "transaction")
+        if account.currency is not transaction.currency:
+            raise InvalidOperationError("Transaction currency must match account currency")
+        account._validate_amount(transaction.amount)
+
+        recipient = None
+        recipient_amount = None
+        if is_transfer:
+            if transaction.recipient_id == transaction.sender_id:
+                raise InvalidOperationError("Transfer requires two different accounts")
+            if transaction.recipient_id not in self._accounts:
+                raise InvalidOperationError("Recipient account not found")
+            recipient = self._accounts[transaction.recipient_id]
+            if recipient.currency is account.currency and exchange_rate != Decimal("1"):
+                raise InvalidOperationError("Same-currency exchange rate must be one")
+            recipient_amount = (transaction.amount * exchange_rate).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            recipient._validate_amount(recipient_amount)
+            if account._balance < 0 and not isinstance(account, PremiumAccount):
+                raise InvalidOperationError("Transfers from negative balances are prohibited")
+
+        fee = external_fee
+        if transaction.transaction_type is not TransactionType.DEPOSIT and isinstance(account, PremiumAccount):
+            fee += account.fixed_fee
+        balances = [(account, account._balance)]
+        if recipient is not None:
+            balances.append((recipient, recipient._balance))
+
+        with self._authorize_account_operation():
+            account._validate_status()
+            if recipient is not None:
+                recipient._validate_status()
+            try:
+                if transaction.transaction_type is TransactionType.DEPOSIT:
+                    account.deposit(transaction.amount)
+                elif transaction.transaction_type is TransactionType.WITHDRAWAL:
+                    account.withdraw(transaction.amount)
+                else:
+                    account.withdraw(transaction.amount + external_fee)
+                    recipient.deposit(recipient_amount)
+                result = {
+                    "fee": fee,
+                    "exchange_rate": exchange_rate if is_transfer else None,
+                    "recipient_amount": recipient_amount,
+                    "recipient_currency": recipient.currency if recipient is not None else None,
+                }
+                self._transaction_results[transaction.id] = result
+            except Exception:
+                for changed_account, balance in balances:
+                    changed_account._balance = balance
+                raise
+        return result.copy()
 
     def invest(self, client_id: str, account_id: str, asset_type: str, amount: Decimal) -> None:
         account = self._validate_account_access(client_id, account_id, "invest")
@@ -186,7 +283,7 @@ class Bank:
         return result
 
     def _get_current_time(self) -> datetime:
-        return datetime.now()
+        return datetime.now().astimezone()
 
     def _validate_operation_time(self, operation: str) -> None:
         current_time = self._get_current_time()
@@ -195,7 +292,8 @@ class Bank:
                 f"Restricted operation: {operation} at "
                 f"{current_time.strftime('%H:%M')}"
             )
-            raise InvalidOperationError("Bank operations are restricted from 00:00 to 05:00")
+            retry_at = current_time.replace(hour=5, minute=0, second=0, microsecond=0)
+            raise BankOperationRestrictedError(retry_at.astimezone(timezone.utc))
 
     def _get_account_total(self, account: BankAccount) -> Decimal:
         total = account._balance
