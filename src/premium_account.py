@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from src.exceptions import InvalidOperationError, InsufficientFundsError
-from src.models import BankAccount, AccountStatus, Currency
+from src.models import BankAccount, AccountStatus, Currency, validate_money_precision
 
 
 class PremiumAccount(BankAccount):
@@ -16,6 +16,7 @@ class PremiumAccount(BankAccount):
         for value in (withdrawal_limit, overdraft_limit, fixed_fee):
             if not isinstance(value, Decimal) or not value.is_finite():
                 raise InvalidOperationError("Premium account parameters must be finite Decimal values")
+            validate_money_precision(value)
         if withdrawal_limit <= 0 or overdraft_limit < 0 or fixed_fee < 0:
             raise InvalidOperationError("InvalidOperationError")
         super().__init__(owner, currency, account_id, status)

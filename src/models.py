@@ -12,6 +12,13 @@ from src.exceptions import InvalidOperationError
 from src.exceptions import InsufficientFundsError
 
 
+def validate_money_precision(amount: Decimal) -> None:
+    digits = amount.as_tuple()
+    extra_places = -digits.exponent - 2
+    if extra_places > 0 and any(digits.digits[-extra_places:]):
+        raise InvalidOperationError("Amount must be a multiple of 0.01")
+
+
 class AccountStatus(Enum):
     ACTIVE = "active"
     FROZEN = "frozen"
@@ -93,6 +100,7 @@ class BankAccount(AbstractAccount):
                 or amount <= 0
         ):
             raise InvalidOperationError("Invalid transaction amount")
+        validate_money_precision(amount)
 
     def _validate_funds(self, amount: Decimal):
         if amount > self._balance:

@@ -1,5 +1,5 @@
 """Functional scenarios for Day 3 Bank system."""
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -16,10 +16,7 @@ from src.savings_account import SavingsAccount
 
 @pytest.fixture
 def bank():
-    bank = Bank("ItGrind Bank")
-    # Admin operations work deterministically regardless of when tests run.
-    with patch.object(bank, "_get_current_time", return_value=datetime(2026, 10, 15, 12, 0)):
-        yield bank
+    return Bank("ItGrind Bank", clock=lambda: datetime(2026, 10, 15, 12, tzinfo=timezone.utc))
 
 
 def register(bank, name="Ivan Ivanov", password="secret"):
@@ -132,12 +129,12 @@ def test_blocked_client_cannot_open_account(bank):
 def test_night_restriction_and_morning_boundary(bank):
     client = register(bank)
     account = BankAccount(owner=client.full_name)
-    with patch.object(bank, "_get_current_time", return_value=datetime(2026, 10, 15, 4, 59)):
+    with patch.object(bank, "clock", return_value=datetime(2026, 10, 15, 4, 59, tzinfo=bank.bank_timezone)):
         with pytest.raises(InvalidOperationError, match="00:00 to 05:00"):
             bank.open_account(client.client_id, account)
     assert bank.search_accounts() == []
     assert len(bank.suspicious_activities) == 1
-    with patch.object(bank, "_get_current_time", return_value=datetime(2026, 10, 15, 5, 0)):
+    with patch.object(bank, "clock", return_value=datetime(2026, 10, 15, 5, 0, tzinfo=bank.bank_timezone)):
         bank.open_account(client.client_id, account)
     assert bank.search_accounts() == [account]
 
@@ -200,9 +197,9 @@ def test_money_operations_blocked_after_lockout(bank):
     with pytest.raises(InvalidOperationError):
         bank.authenticate_client(client.client_id, "wrong")
     for call in (
-        lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
-        lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
-        lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
+            lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
+            lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
+            lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
     ):
         with pytest.raises(InvalidOperationError, match="blocked"):
             call()
@@ -214,11 +211,11 @@ def test_money_operations_restricted_at_night(bank):
     client = register(bank)
     account = InvestmentAccount(owner=client.full_name)
     bank.open_account(client.client_id, account)
-    with patch.object(bank, "_get_current_time", return_value=datetime(2026, 10, 15, 2)):
+    with patch.object(bank, "clock", return_value=datetime(2026, 10, 15, 2, tzinfo=bank.bank_timezone)):
         for call in (
-            lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
-            lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
-            lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
+                lambda: bank.deposit(client.client_id, account.uuid, Decimal("100")),
+                lambda: bank.withdraw(client.client_id, account.uuid, Decimal("100")),
+                lambda: bank.invest(client.client_id, account.uuid, "stocks", Decimal("100")),
         ):
             with pytest.raises(InvalidOperationError, match="00:00 to 05:00"):
                 call()
