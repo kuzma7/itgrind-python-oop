@@ -8,7 +8,7 @@ from src.exceptions import (
     InvalidOperationError,
     TemporaryTransactionError,
 )
-from src.models import Currency
+from src.models import Currency, EXCHANGE_RATES_IN_RUB
 from src.transaction import ExternalRecipient, Transaction, TransactionStatus, TransactionType
 from src.transaction_queue import TransactionQueue
 
@@ -46,13 +46,7 @@ class TransactionProcessor:
     MAX_ATTEMPTS = 3
     RETRY_DELAY = timedelta(minutes=1)
     EXTERNAL_FEE_RATE = Decimal("0.01")
-    EXCHANGE_RATES = {
-        Currency.RUB: Decimal("1"),
-        Currency.USD: Decimal("90"),
-        Currency.EUR: Decimal("100"),
-        Currency.KZT: Decimal("0.20"),
-        Currency.CNY: Decimal("12.50"),
-    }
+    EXCHANGE_RATES = EXCHANGE_RATES_IN_RUB
 
     def __init__(
         self, bank: Bank, queue: TransactionQueue, external_adapter: ExternalTransferAdapter | None = None,
@@ -88,16 +82,7 @@ class TransactionProcessor:
         return self.EXCHANGE_RATES[source] / self.EXCHANGE_RATES[target]
 
     def _record_error(self, transaction: Transaction, error: Exception, now: datetime) -> None:
-        entry = {
-            "transaction_id": transaction.id,
-            "attempt": transaction.attempts,
-            "timestamp": now,
-            "error_type": type(error).__name__,
-            "reason": str(error),
-        }
-        transaction.failure_reason = str(error)
-        transaction.errors.append(entry.copy())
-        self.errors.append(entry)
+        self.errors.extend(self.bank.record_transaction_error(transaction, error, now))
 
     def _complete(self, transaction: Transaction, result: dict, now: datetime) -> None:
         transaction.fee = result["fee"]

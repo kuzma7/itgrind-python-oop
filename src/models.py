@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
+from datetime import timedelta, timezone
 
 _bank_operation_token: ContextVar[object | None] = ContextVar("bank_operation_token", default=None)
 from enum import Enum
@@ -31,6 +32,16 @@ class Currency(Enum):
     EUR = "EUR"
     KZT = "KZT"
     CNY = "CNY"
+
+
+DEFAULT_BANK_TIMEZONE = timezone(timedelta(hours=3), "UTC+03:00")
+EXCHANGE_RATES_IN_RUB = {
+    Currency.RUB: Decimal("1"),
+    Currency.USD: Decimal("90"),
+    Currency.EUR: Decimal("100"),
+    Currency.KZT: Decimal("0.20"),
+    Currency.CNY: Decimal("12.50"),
+}
 
 
 class AbstractAccount(ABC):
