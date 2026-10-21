@@ -1,6 +1,6 @@
 ﻿# Bank Management System — Python OOP
 
-Educational project for the **ItGrind ML/NLP course**, covering Days 1–5 of the Python OOP module.
+Educational project for the **ItGrind ML/NLP course**, covering Days 1–7 of the Python OOP module.
 
 ## Features
 
@@ -15,6 +15,7 @@ Educational project for the **ItGrind ML/NLP course**, covering Days 1–5 of th
 - Bank: account lifecycle, ownership checks, balances by currency and client rankings.
 - Transactions: deposits, withdrawals and internal/external transfers; priority, scheduling, cancellation and retries.
 - Audit: JSONL events, filtering, suspicious-operation reports, client risk profiles and error statistics.
+- Reports: client, bank and risk summaries in TXT, JSON and CSV; pie, bar and balance-history charts with matplotlib.
 
 ## Main rules
 
@@ -46,10 +47,12 @@ src/
 ├── transaction*.py           # Transaction model, queue and processor
 ├── audit_log.py              # Journal, filters and audit reports
 ├── risk_analyzer.py          # Risk rules and client profiles
+├── report_builder.py         # Reports, exports and charts
+├── demo.py                   # Day 7 reporting demonstration
 ├── exceptions.py
 └── main.py                   # Demonstrations for Days 1–5
 tests/                       # Functional tests
-requirements.txt             # pytest
+requirements.txt             # pytest, matplotlib
 ```
 
 ## Setup and run
@@ -66,12 +69,14 @@ python -m src.main
 The demonstration processes ten Day 4 transactions and shows Day 5 risk decisions and reports.
 Audit events are appended to `logs/audit.jsonl`; generated logs are excluded from Git.
 
+Run `python -m src.demo` for Day 7: 40 transactions, reports in `reports/`, three PNG charts in `reports/charts/` and audit events in `logs/day7_audit.jsonl`.
+
 ## Tests
 
 ```powershell
 python -m pytest -q
 ```
 
-Functional tests cover balances, account limits, access restrictions, queue behavior, conversion, fees, retries, rollback, duplicate protection, risk blocking and audit reports.
+Functional tests cover balances, account limits, access restrictions, queue behavior, conversion, fees, retries, rollback, duplicate protection, risk blocking, report exports and chart generation.
 
 This is a single-threaded application with balances, queues and risk history kept in memory. External payments use a simulator. Existing JSONL records are not loaded into reports automatically.

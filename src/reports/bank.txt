@@ -1,0 +1,48 @@
+bank_name: ItGrind Demo Bank
+
+clients_count: 7
+
+accounts_count: 12
+
+transactions_count: 40
+
+transactions_by_status:
+{
+  "completed": 35,
+  "failed": 5
+}
+
+transactions_by_type:
+{
+  "deposit": 8,
+  "withdrawal": 9,
+  "transfer": 23
+}
+
+balances:
+{
+  "RUB": "1457165.00",
+  "USD": "4749.50"
+}
+
+top_3_clients:
+[
+  {
+    "client_id": "104db632",
+    "full_name": "Nikita Kuznetsov",
+    "balance": "453980.00",
+    "currency": "RUB"
+  },
+  {
+    "client_id": "6689ad49",
+    "full_name": "Maria Petrova",
+    "balance": "339950.00",
+    "currency": "RUB"
+  },
+  {
+    "client_id": "9959f26b",
+    "full_name": "Dmitry Volkov",
+    "balance": "260500.00",
+    "currency": "RUB"
+  }
+]

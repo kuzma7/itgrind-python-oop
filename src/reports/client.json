@@ -1,0 +1,114 @@
+{
+    "client_id": "104db632",
+    "full_name": "Nikita Kuznetsov",
+    "status": "active",
+    "accounts": [
+        {
+            "account_id": "39657d50",
+            "type": "BankAccount",
+            "balance": "141980.00",
+            "currency": "RUB",
+            "status": "active"
+        },
+        {
+            "account_id": "bc6c7921",
+            "type": "SavingsAccount",
+            "balance": "312000.00",
+            "currency": "RUB",
+            "status": "active"
+        }
+    ],
+    "transaction_count": 10,
+    "transactions": [
+        {
+            "transaction_id": "82bfb115300f47cf85c0701573354c8e",
+            "type": "deposit",
+            "amount": "10000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "86ca96e7deb74c5d8496d8825b53b19e",
+            "type": "withdrawal",
+            "amount": "3000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "80e8ac4044d4435b9b1d4aeb2b4cf16c",
+            "type": "transfer",
+            "amount": "5000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "531665c6c50b45fdb1562ab5afa16e8d",
+            "type": "transfer",
+            "amount": "4000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "1b9accb2ccce4c94806e42b649fb5cac",
+            "type": "transfer",
+            "amount": "12000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "7d6dec9211574b6da774b6ef52eda877",
+            "type": "transfer",
+            "amount": "2000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "20.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "0db321839080438ba848dd6fa2d52a7c",
+            "type": "transfer",
+            "amount": "100",
+            "currency": "USD",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "9ff876da07b147198c60dd8469f5f299",
+            "type": "transfer",
+            "amount": "9000",
+            "currency": "RUB",
+            "status": "completed",
+            "fee": "0.00",
+            "failure_reason": null
+        },
+        {
+            "transaction_id": "ac2a51a54c4a453f9390b9d5655dd3d4",
+            "type": "withdrawal",
+            "amount": "1000",
+            "currency": "RUB",
+            "status": "failed",
+            "fee": "0.00",
+            "failure_reason": "Account not found or does not belong to client"
+        },
+        {
+            "transaction_id": "c8dedc76e1aa45fe9e0f5ea5e227802e",
+            "type": "transfer",
+            "amount": "120000",
+            "currency": "RUB",
+            "status": "failed",
+            "fee": "0.00",
+            "failure_reason": "Transaction blocked by risk rules: large_amount, new_recipient"
+        }
+    ]
+}
