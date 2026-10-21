@@ -1,6 +1,9 @@
-from collections import Counter
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
+
+import matplotlib
+
+matplotlib.use("Agg")
 
 from src.audit_log import AuditLog
 from src.bank import Bank
@@ -8,16 +11,17 @@ from src.client import Client
 from src.investment_account import InvestmentAccount
 from src.models import BankAccount, Currency
 from src.premium_account import PremiumAccount
+from src.report_builder import ReportBuilder
 from src.risk_analyzer import RiskAnalyzer
 from src.savings_account import SavingsAccount
-from src.transaction import TransactionType, ExternalRecipient, Transaction, TransactionStatus
+from src.transaction import TransactionType, ExternalRecipient, Transaction
 from src.transaction_processor import TransactionProcessor
 from src.transaction_queue import TransactionQueue
 
 
 def create_demo_bank():
     now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
-    audit = AuditLog("logs/day6_audit.jsonl")
+    audit = AuditLog("logs/day7_audit.jsonl")
     risk = RiskAnalyzer()
     bank = Bank("ItGrind Demo Bank", clock=lambda: now, audit_log=audit, risk_analyzer=risk)
 
@@ -45,11 +49,9 @@ def create_demo_bank():
         "elena_premium": PremiumAccount(owner=clients["elena"].full_name),
     }
 
-    # TODO: Создать и зарегистрировать 7 клиентов
     for client in clients.values():
         bank.add_client(client)
 
-    # TODO: Создать и открыть 12 счетов
     bank.open_account(clients["nikita"].client_id, accounts["nikita_standard"])
     bank.open_account(clients["nikita"].client_id, accounts["nikita_savings"])
 
@@ -179,166 +181,67 @@ def create_demo_transactions(clients: dict, accounts: dict) -> list[Transaction]
     return transactions
 
 
-def run_simulation(queue: TransactionQueue, processor: TransactionProcessor, transactions: list[Transaction]) -> None:
+def collect_balance_snapshot(accounts: dict, timestamp: datetime, history: dict) -> None:
+    for name, account in accounts.items():
+        history.setdefault(name, []).append({
+            "timestamp": timestamp,
+            "balance": account._balance,
+            "currency": account.currency.value,
+        })
+
+
+def run_simulation(
+    queue: TransactionQueue, processor: TransactionProcessor,
+    transactions: list[Transaction], accounts: dict,
+) -> dict:
+    history = {}
     start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
 
-    print("\n=== TRANSACTION QUEUE ===")
-    for index, transaction in enumerate(transactions, 1):
+    collect_balance_snapshot(accounts, start - timedelta(seconds=1), history)
+
+    for transaction in transactions:
         queue.add(transaction)
-        print(
-            f"[QUEUED] #{index:02} | {transaction.transaction_type.value} | {transaction.amount} {transaction.currency.value}")
 
-    print(f"\nTotal queued: {len(queue)}")
-
-    print("\n=== TRANSACTION PROCESSING ===")
     for minute in range(85):
         now = start + timedelta(minutes=minute)
-        processed = processor.process_all(now)
 
-        for transaction in processed:
-            status = transaction.status.value.upper()
-            reason = f" | {transaction.failure_reason}" if transaction.failure_reason else ""
-            print(f"[{status}] {transaction.id[:8]} | {transaction.amount} {transaction.currency.value}{reason}")
+        while True:
+            processed = processor.process_next(now)
+            if processed is None:
+                break
 
-    print(f"\nWaiting before next day: {len(queue)}")
+            collect_balance_snapshot(accounts, now, history)
 
-    print("\n=== DELAYED TRANSACTIONS ===")
     next_day = start + timedelta(days=1)
 
-    for transaction in processor.process_all(next_day):
-        status = transaction.status.value.upper()
-        reason = f" | {transaction.failure_reason}" if transaction.failure_reason else ""
-        print(f"[{status}] {transaction.id[:8]} | {transaction.amount} {transaction.currency.value}{reason}")
+    while True:
+        processed = processor.process_next(next_day)
+        if processed is None:
+            break
 
-    print("\n=== FINAL TRANSACTION STATUSES ===")
-    for index, transaction in enumerate(transactions, 1):
-        reason = transaction.failure_reason or "-"
-        print(
-            f"{index:02}. {transaction.transaction_type.value:<10} | {transaction.status.value:<12} | attempts={transaction.attempts} | {reason}")
+        collect_balance_snapshot(accounts, next_day, history)
 
-    completed = sum(tx.status is TransactionStatus.COMPLETED for tx in transactions)
-    failed = sum(tx.status is TransactionStatus.FAILED for tx in transactions)
-    cancelled = sum(tx.status is TransactionStatus.CANCELLED for tx in transactions)
-    pending = sum(tx.status in (TransactionStatus.PENDING, TransactionStatus.RETRY_WAIT) for tx in transactions)
-
-    print("\n=== SIMULATION SUMMARY ===")
-    print(f"Total: {len(transactions)}")
-    print(f"Completed: {completed}")
-    print(f"Failed: {failed}")
-    print(f"Cancelled: {cancelled}")
-    print(f"Pending: {pending}")
-    print(f"Errors recorded: {len(processor.errors)}")
-
-
-def show_client_info(bank: Bank, client: Client, transactions: list[Transaction]) -> None:
-    print(f"\n=== CLIENT PROFILE: {client.full_name} ===")
-    print(f"Client ID: {client.client_id}")
-    print(f"Status: {client.status.value}")
-
-    accounts = bank.search_accounts(client_id=client.client_id)
-    print(f"\nAccounts ({len(accounts)}):")
-
-    for account in accounts:
-        print(
-            f"  {account.uuid} | {type(account).__name__} | {account._balance} {account.currency.value} | {account.account_status.value}")
-
-    account_ids = set(client.account_ids)
-    history = [
-        tx for tx in transactions
-        if tx.client_id == client.client_id or tx.sender_id in account_ids or tx.recipient_id in account_ids
-    ]
-
-    print(f"\nTransaction history ({len(history)}):")
-
-    for tx in history:
-        print(
-            f"  {tx.id[:8]} | {tx.transaction_type.value:<10} | {tx.amount:>10} {tx.currency.value} | {tx.status.value}")
-
-        if tx.failure_reason:
-            print(f"    Reason: {tx.failure_reason}")
-
-
-def show_suspicious_operations(audit: AuditLog) -> None:
-    suspicious = audit.get_suspicious_operations()
-
-    print("\n=== SUSPICIOUS OPERATIONS ===")
-    print(f"Suspicious risk checks: {len(suspicious)}")
-
-    if not suspicious:
-        print("No suspicious operations detected")
-        return
-
-    for entry in suspicious:
-        details = entry["details"]
-        print(f"  Transaction: {entry['transaction_id'][:8]}")
-        print(f"  Client: {entry['client_id']}")
-        print(f"  Risk level: {details['risk_level']}")
-        print(f"  Score: {details['score']}")
-        print(f"  Reasons: {', '.join(details['reasons'])}")
-        print()
-
-
-def show_reports(bank: Bank, transactions: list[Transaction], audit: AuditLog) -> None:
-    print("\n=== BANK REPORT ===")
-
-    statuses = Counter(tx.status.value for tx in transactions)
-    types = Counter(tx.transaction_type.value for tx in transactions)
-
-    print("\nTransaction statistics:")
-    print(f"Total: {len(transactions)}")
-
-    for status in TransactionStatus:
-        print(f"  {status.value}: {statuses[status.value]}")
-
-    print("\nTransaction types:")
-    for transaction_type in TransactionType:
-        print(f"  {transaction_type.value}: {types[transaction_type.value]}")
-
-    print(f"\nTotal processing attempts: {sum(tx.attempts for tx in transactions)}")
-    print(f"Recorded errors: {len(bank.transaction_errors)}")
-
-    suspicious = audit.get_suspicious_operations()
-    suspicious_ids = {entry["transaction_id"] for entry in suspicious}
-    blocked_ids = {
-        entry["transaction_id"]
-        for entry in suspicious
-        if entry["details"]["risk_level"] == "HIGH"
-    }
-
-    print(f"Suspicious transactions: {len(suspicious_ids)}")
-    print(f"High-risk transactions: {len(blocked_ids)}")
-
-    print("\nTop 3 clients (RUB):")
-    ranking = bank.get_clients_ranking(Currency.RUB)
-
-    for place, (client, balance) in enumerate(ranking[:3], 1):
-        print(f"  {place}. {client.full_name}: {balance} RUB")
-
-    print("\nTotal bank balance:")
-    for currency, balance in bank.get_total_balance().items():
-        print(f"  {currency.value}: {balance}")
-
-    print("\nError statistics:")
-    for error_type, count in audit.get_error_statistics().items():
-        print(f"  {error_type}: {count}")
+    return history
 
 
 if __name__ == "__main__":
     bank, clients, accounts, queue, processor, audit, risk = create_demo_bank()
     fund_demo_accounts(bank, clients, accounts)
-
     transactions = create_demo_transactions(clients, accounts)
+    history = run_simulation(queue, processor, transactions, accounts)
 
-    print("\n=== BANK INITIALIZATION ===")
-    print(f"Bank: {bank.name}")
-    print(f"Clients: {len(clients)}")
-    print(f"Accounts: {len(accounts)}")
-    print(f"Transactions: {len(transactions)}")
+    builder = ReportBuilder(bank, transactions, audit)
+    reports = {
+        "client": builder.build_client_report(clients["nikita"].client_id),
+        "bank": builder.build_bank_report(),
+        "risk": builder.build_risk_report(),
+    }
+    for name, report in reports.items():
+        print(f"\n=== DAY 7: {name.upper()} REPORT ===")
+        print(builder.build_text_report(report))
+        builder.export_to_json(report, f"reports/{name}.json")
+        builder.export_to_csv(report, f"reports/{name}.csv")
+        builder.export_to_txt(report, f"reports/{name}.txt")
 
-    run_simulation(queue, processor, transactions)
-
-    show_client_info(bank, clients["nikita"], transactions)
-    show_client_info(bank, clients["maria"], transactions)
-
-    show_suspicious_operations(audit)
-    show_reports(bank, transactions, audit)
+    builder.save_charts("reports/charts", history, "nikita_standard")
+    print("\nDay 7: Reports and charts saved to reports/")
